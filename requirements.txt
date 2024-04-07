@@ -1,0 +1,8 @@
+black
+datasets
+deepspeed
+matplotlib
+ruff
+transformers
+torch
+wandb
