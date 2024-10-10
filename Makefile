@@ -5,9 +5,9 @@ test:
 	python -m pytest -vv *.py
 
 format:
-	black */*.py
+	black llamlam/*.py
 
 lint:
-	ruff check .
+	ruff check ./llamlam
 
 all: install lint test format

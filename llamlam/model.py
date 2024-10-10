@@ -1,31 +1,48 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 from torch.nn import functional as F
 
-from activation import GELU
+from llamlam.activation import GELU
 
 
-class LMConfig:
-    def __init__(self, vocab_size, max_length, n_layer, n_head, n_embd):
-        self.vocab_size = vocab_size
-        self.max_length = max_length
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
+class LayerNorm(nn.Module):
+    """
+    LayerNorm as described in https://arxiv.org/abs/1607.06450
+    LayerNorm = ((x - mean) / sqrt(variance + epsilon)) * gamma + beta
+
+    Args:
+        ndim: number of dimensions of the input tensor
+        bias: whether to estimate a biased or unbiased standard deviation
+        eps: small value to prevent division by zero or very small variance
+    """
+
+    def __init__(self, ndim, bias, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+
+    def forward(self, input):
+        return F.layer_norm(
+            input,
+            normalized_shape=self.weight.shape,
+            weight=self.weight,
+            bias=self.bias,
+            eps=self.eps,
+        )
 
 
 class Attention(nn.Module):
 
-    def __init__(self, embed_dim, n_heads, alpha=0.5):
+    def __init__(self, n_embd, n_head, alpha=0.5):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.n_heads = n_heads
-        self.head_dim = embed_dim // n_heads
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
 
-        assert (
-            self.head_dim * n_heads == embed_dim
-        ), "embed_dim must be divisible by n_heads"
+        assert self.head_dim * n_head == n_embd, "n_embd must be divisible by n_head"
 
         # Scale factor for dot product attention
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -34,34 +51,32 @@ class Attention(nn.Module):
         # To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.out_proj = nn.Linear(n_embd, n_embd, bias=False)
 
         # Initialization for linear layers
         for name, param in self.qkv_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / embed_dim) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
         for name, param in self.out_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / embed_dim) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
 
     def forward(self, x, mask=None):
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
         qkv = qkv.reshape(
-            batch_size, seq_length, self.n_heads, 3 * self.head_dim
-        )  # [B, L, n_heads, 3 * d]
+            batch_size, seq_length, self.n_head, 3 * self.head_dim
+        )  # [B, L, n_head, 3 * d]
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_head L d]
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
         )
-        attn_output = attn_output.transpose(1, 2).reshape(
-            batch_size, seq_length, self.embed_dim
-        )
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, self.n_embd)
         output = self.out_proj(attn_output)
         return output
 
@@ -91,9 +106,9 @@ class Block(nn.Module):
         #     nn.Conv1D(4 * config.n_embd, config.n_embd),
         # )
 
-        self.dropout = nn.Dropout(p=0.1)
-        self.norm_1 = nn.LayerNorm(config.n_embd, eps=1e-5)
-        self.norm_2 = nn.LayerNorm(config.n_embd, eps=1e-5)
+        self.dropout = nn.Dropout(p=config.dropout)
+        self.norm_1 = LayerNorm(config.n_embd, bias=config.bias, eps=1e-5)
+        self.norm_2 = LayerNorm(config.n_embd, bias=config.bias, eps=1e-5)
 
     def forward(self, x):
         attn = self.attention(self.norm_1(x))
@@ -116,14 +131,14 @@ class GPTModel(nn.Module):
         self.ln_f = nn.LayerNorm(config.n_embd)
         self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.loss_fn = nn.CrossEntropyLoss()
+        self.bias = config.bias
+        self.dropout = config.dropout
 
         init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.n_embd))
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(
-            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
-        )
+        position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         hidden_states = []
@@ -138,18 +153,83 @@ class GPTModel(nn.Module):
 
         x = self.ln_f(x)
         logits = self.head(x).float()
-
         outputs = {"logits": logits}
+
         if input_ids is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
 
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
+            loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states
 
         return outputs
+
+    def save_pretrained(self, output_dir, tag, optimizer=None):
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(self.state_dict(), output_dir / f"model_{tag}.pt")
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), output_dir / f"optimizer_{tag}.pt")
+
+    @classmethod
+    def from_pretrained(cls, config, args):
+        model = cls(config)
+        model.load_state_dict(torch.load(args["model_name_or_path"], weights_only=True))
+        model.eval()
+        return model
+
+    def generate(self, tokenizer, prompt, max_new_tokens=100):
+        """
+        Generate text from the model.
+
+        Args:
+            tokenizer: Tokenizer instance
+            prompt: Text to start generation with
+            max_new_tokens: Maximum number of new tokens to generate
+
+        Returns:
+            Decoded text
+        """
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+
+        self.eval()
+        self.to(device)
+
+        # Encode prompt
+        token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # TeuxDeux:
+        # - top_k
+        # - top_p
+        # - temperature
+
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+
+                # Crop current context if it exceeds the supported context size
+                # E.g., if LLM supports only 5 tokens, and the context size is 10
+                # then only the last 5 tokens are used as context
+                idx_cond = token_ids[:, -self.config.max_length :]
+
+                # Get the predictions
+                with torch.no_grad():
+                    logits = self(idx_cond)["logits"]
+
+                # Focus only on the last time step
+                # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+                logits = logits[:, -1, :]
+
+                # Get the idx of the vocab entry with the highest logits value
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
+
+                # Append sampled index to the running sequence
+                token_ids = torch.cat((token_ids, idx_next), dim=1)  # (batch, n_tokens+1)
+
+        # Decode and return the generated text
+        return tokenizer.decode(token_ids[0], skip_special_tokens=True)
