@@ -13,3 +13,8 @@ deepspeed --num_gpus $(nvidia-smi -L | wc -l) llamlam/train.py --batch_size 16 -
 # ran: deepspeed --num_gpus $(nvidia-smi -L | wc -l) llamlam/train.py --learning_rate 1e-4 --head_width 32 --run_name "test"
 #      with default batch_size 16
 ```
+
+## TeuxDeux
+
+- add distributed training (zero optimization, etc.)
+- add model checkpointing

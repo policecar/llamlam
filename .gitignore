@@ -2,6 +2,8 @@
 data/*
 .DS_Store
 wandb
+.aider*
+.vscode/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
