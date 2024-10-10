@@ -13,7 +13,7 @@ from datasets import load_dataset
 from deepspeed import get_accelerator
 from deepspeed.utils import logger
 from pathlib import Path
-import torch.optim as optim
+from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from transformers import AutoTokenizer, default_data_collator, get_scheduler
 
@@ -148,6 +148,7 @@ def main(
     num_train_epochs,
     lr_scheduler_type,
 ):
+
     # set seed first thing
     random.seed(seed)
     np.random.seed(seed)
@@ -157,10 +158,10 @@ def main(
     if run_name is None:
         run_name = f"LR:{learning_rate}_HeadWidth:{head_width}_TotalBS:{batch_size}_Nhead:{n_head}_NLayer:{n_layer}"
 
-    output_dir = Path().resolve(__file__) / "data" / output_dir / run_name
+    output_dir = Path(__file__).resolve().parent.parent / "data" / "output" / run_name
     os.makedirs(output_dir, exist_ok=True)
 
-    device = torch.device(get_accelerator().device_name())
+    device = torch.device(get_accelerator().device_name())  # type: ignore
 
     train_config = {
         "train_batch_size": batch_size,
@@ -197,7 +198,7 @@ def main(
     )
 
     model = GPTModel(config)
-    model.train()
+    # model.train()
 
     # Declare datasets, samplers, and dataloaders
     train_dataset = CustomDataset(tokenizer, "train", debug=debug)
@@ -228,7 +229,6 @@ def main(
 
     optimizer_grouped_parameters = []
     final_optimizer_settings = {}
-
     for n, p in model.named_parameters():
         group_parameters = {}
         if p.requires_grad:
@@ -256,10 +256,7 @@ def main(
     with open(os.path.join(output_dir, "opt_config.json"), "w") as json_file:
         json.dump(final_optimizer_settings, json_file, indent=4)
 
-    AdamOptimizer = optim.Adam
-    optimizer = AdamOptimizer(
-        optimizer_grouped_parameters, lr=learning_rate, betas=(0.9, 0.95)
-    )
+    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, betas=(0.9, 0.95))
 
     # Define learning rate scheduler
     lr_scheduler = get_scheduler(
