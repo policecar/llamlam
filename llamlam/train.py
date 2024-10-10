@@ -19,8 +19,8 @@ from transformers import AutoTokenizer, default_data_collator, get_scheduler
 
 from model import LMConfig, GPTModel
 
-# very much based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
-# without the distributed bit
+# based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
+# without distributed training (zero optimization, etc.)
 
 
 class CustomDataset(Dataset):
@@ -52,44 +52,47 @@ class CustomDataset(Dataset):
         return {"input_ids": inputs.input_ids.squeeze()}
 
 
-def train(ds_engine, train_loader, device):
-    ds_engine.train()
+def train(model_engine, train_loader, device):
+    """ """
+    model_engine.train()
     total_loss = 0
-    for batch in train_loader:
+    for step, batch in enumerate(train_loader):
+        # optimizer.zero_grad()  # reset loss gradients, handled by model_engine
+        # send data to device and convert to desired data type
         input_ids = batch["input_ids"].to(device)
-        outputs = ds_engine(input_ids)
+        # forward pass
+        outputs = model_engine(input_ids)
         loss = outputs["loss"]
         total_loss += loss.item()
 
         logger.info(f"loss : {loss.item()}")
         wandb.log({"trainloss": loss.item()})
 
-        ds_engine.backward(loss)
-        ds_engine.step()
-        get_accelerator().empty_cache()
+        model_engine.backward(loss)  # run backpropagation
+        model_engine.step()  # update parameters and learning rate, zeros gradients
+        # get_accelerator().empty_cache()  # clear cache
 
     avg_loss = total_loss / len(train_loader)
     return avg_loss
 
 
-def validate(model, val_loader, device):
-    model.eval()
+def validate(model_engine, val_loader, device):
+    """ """
+    model_engine.eval()
     total_loss = 0
     with torch.no_grad():
         for batch in val_loader:
             input_ids = batch["input_ids"].to(device)
-            outputs = model(input_ids)
+            outputs = model_engine(input_ids)
             loss = outputs["loss"]
             total_loss += loss.float()
 
     losses = total_loss / len(val_loader)
 
     try:
-        perplexity = torch.exp(losses).item()
+        perplexity = torch.exp(losses).item()  # type: ignore
     except OverflowError:
         perplexity = float("inf")
-
-    model.train()
 
     return losses, perplexity
 
@@ -98,15 +101,20 @@ def save_model(model, save_dir):
     os.makedirs(save_dir, exist_ok=True)
     output_model_file = os.path.join(save_dir, "model.pt")
 
-    model_to_save = model.module if hasattr(model, "module") else model
-    torch.save(model_to_save.state_dict(), output_model_file)
+    # model_to_save = model.module if hasattr(model, "module") else model
+    # torch.save(model_to_save.state_dict(), output_model_file)
+    torch.save(model.state_dict(), output_model_file)
+
+
+def load_model(model, save_dir):
+    output_model_file = os.path.join(save_dir, "model.pt")
+    model.load_state_dict(torch.load(output_model_file))
 
 
 @click.command()
 @click.option("--num_warmup_steps", default=0, help="Number of warmup steps")
 @click.option("--seed", default=42, help="Random seed")
 @click.option("--output_dir", default="experiments", help="Output directory")
-@click.option("--offload", default=True, help="Offload computation")
 @click.option("--debug", is_flag=True, help="Debug mode")
 @click.option("--run_name", default=None, help="Run name")
 @click.option("--local_rank", default=-1, help="Local rank")
@@ -128,10 +136,9 @@ def main(
     num_warmup_steps,
     seed,
     output_dir,
-    offload,
+    local_rank,  # needed for deepspeed
     debug,
     run_name,
-    local_rank,
     n_layer,
     n_head,
     head_width,
@@ -155,26 +162,26 @@ def main(
 
     device = torch.device(get_accelerator().device_name())
 
-    ds_config = {
+    train_config = {
         "train_batch_size": batch_size,
         "bfloat16": {"enabled": False},  # True
         "gradient_clipping": 1.0,
     }
 
-    # Initialize wandb
+    # Initialize WandB
     wandb.init(
         name=run_name,
         config={
+            "seed": seed,
             "learning_rate": learning_rate,
-            "weight_decay": weight_decay,
-            "num_train_epochs": num_train_epochs,
             "lr_scheduler_type": lr_scheduler_type,
             "num_warmup_steps": num_warmup_steps,
-            "seed": seed,
-            "output_dir": output_dir,
+            "weight_decay": weight_decay,
+            "num_train_epochs": num_train_epochs,
             "head_width": head_width,
             "Nhead": n_head,
             "NLayer": n_layer,
+            "output_dir": output_dir,
         },
     )
 
@@ -189,17 +196,15 @@ def main(
         n_embd=n_head * head_width,
     )
 
-    # # zero-init
-    # with deepspeed.zero.Init():
     model = GPTModel(config)
-
     model.train()
 
+    # Declare datasets, samplers, and dataloaders
     train_dataset = CustomDataset(tokenizer, "train", debug=debug)
     val_dataset = CustomDataset(tokenizer, "validation", debug=debug)
 
     train_sampler = RandomSampler(train_dataset)
-    eval_sampler = SequentialSampler(val_dataset)
+    val_sampler = SequentialSampler(val_dataset)
 
     train_loader = DataLoader(
         train_dataset,
@@ -210,7 +215,7 @@ def main(
     val_loader = DataLoader(
         val_dataset,
         collate_fn=default_data_collator,
-        sampler=eval_sampler,
+        sampler=val_sampler,
         batch_size=batch_size * 2,
     )
 
@@ -256,6 +261,7 @@ def main(
         optimizer_grouped_parameters, lr=learning_rate, betas=(0.9, 0.95)
     )
 
+    # Define learning rate scheduler
     lr_scheduler = get_scheduler(
         name=lr_scheduler_type,
         optimizer=optimizer,
@@ -263,16 +269,19 @@ def main(
         num_training_steps=num_train_epochs * math.ceil(len(train_loader)),
     )
 
+    # Initialize distributed backend
     model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-        model=model, config=ds_config, lr_scheduler=lr_scheduler, optimizer=optimizer
+        model=model, config=train_config, lr_scheduler=lr_scheduler, optimizer=optimizer
     )
 
+    # Training loop
     for epoch in range(num_train_epochs):
         avg_train_loss = train(model_engine, train_loader, model_engine.device)
-        logger.info(f"Epoch {epoch+1}, Train Loss: {avg_train_loss}")
-        eval_loss, perp = validate(model_engine, val_loader, device=device)
-        logger.info(f"Eval loss : {eval_loss}")
-        wandb.log({"ppl": perp, "loss": eval_loss, "epoch": epoch})
+        val_loss, perp = validate(model_engine, val_loader, device=device)
+        logger.info(
+            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+        )
+        wandb.log({"ppl": perp, "loss": val_loss, "epoch": epoch})
 
         model_output_dir = os.path.join(output_dir, f"step_{epoch}_final")
         save_model(model_engine, model_output_dir)
