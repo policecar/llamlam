@@ -1,208 +1,143 @@
-import json
+import argparse
+import logging
 import math
-import numpy as np
 import os
-import random
+import yaml
 
-import click
-import deepspeed
+from datetime import datetime
+from pathlib import Path
+
 import torch
 import wandb
 
-from datasets import load_dataset
-from deepspeed import get_accelerator
-from deepspeed.utils import logger
-from pathlib import Path
 from torch.optim.adamw import AdamW
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
-from transformers import AutoTokenizer, default_data_collator, get_scheduler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from transformers import AutoTokenizer
+from transformers import default_data_collator, get_scheduler
 
-from model import LMConfig, GPTModel
-
-# based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
-# without distributed training (zero optimization, etc.)
-
-
-class CustomDataset(Dataset):
-    def __init__(self, tokenizer, type_path="train", max_length=512, debug=False):
-        if debug:
-            vernum = 2
-        else:
-            vernum = 103
-        self.vernum = vernum
-        self.dataset = load_dataset(
-            "wikitext", f"wikitext-{vernum}-raw-v1", split=type_path
-        )
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return int(len(self.dataset) * 0.1) if (self.vernum == 103) else 32
-
-    def __getitem__(self, idx):
-        text = self.dataset[idx]["text"]
-        # logger.info(text)
-        inputs = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {"input_ids": inputs.input_ids.squeeze()}
+from llamlam.config import LMConfig
+from llamlam.data import CustomDataset
+from llamlam.model import GPTModel
+from llamlam.utils import set_seed
 
 
-def train(model_engine, train_loader, device):
-    """ """
-    model_engine.train()
-    total_loss = 0
-    for step, batch in enumerate(train_loader):
-        # optimizer.zero_grad()  # reset loss gradients, handled by model_engine
-        # send data to device and convert to desired data type
-        input_ids = batch["input_ids"].to(device)
-        # forward pass
-        outputs = model_engine(input_ids)
-        loss = outputs["loss"]
-        total_loss += loss.item()
-
-        logger.info(f"loss : {loss.item()}")
-        wandb.log({"trainloss": loss.item()})
-
-        model_engine.backward(loss)  # run backpropagation
-        model_engine.step()  # update parameters and learning rate, zeros gradients
-        # get_accelerator().empty_cache()  # clear cache
-
-    avg_loss = total_loss / len(train_loader)
-    return avg_loss
-
-
-def validate(model_engine, val_loader, device):
-    """ """
-    model_engine.eval()
-    total_loss = 0
+def eval_model(model, data_loader, device):
+    """Evaluate model on a given dataset."""
+    model.eval()
+    val_loss = 0.
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in data_loader:
             input_ids = batch["input_ids"].to(device)
-            outputs = model_engine(input_ids)
-            loss = outputs["loss"]
-            total_loss += loss.float()
-
-    losses = total_loss / len(val_loader)
+            loss = model(input_ids)["loss"]
+            val_loss += loss.float()
+        val_loss /= len(val_loader)
 
     try:
-        perplexity = torch.exp(losses).item()  # type: ignore
+        perplexity = torch.exp(val_loss).item()  # type: ignore
     except OverflowError:
         perplexity = float("inf")
 
-    return losses, perplexity
+    return val_loss, perplexity
 
 
-def save_model(model, save_dir):
-    os.makedirs(save_dir, exist_ok=True)
-    output_model_file = os.path.join(save_dir, "model.pt")
+if __name__ == "__main__":
 
-    # model_to_save = model.module if hasattr(model, "module") else model
-    # torch.save(model_to_save.state_dict(), output_model_file)
-    torch.save(model.state_dict(), output_model_file)
+    ##############################
+    # Setup
+    ##############################
 
+    # Set up logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
 
-def load_model(model, save_dir):
-    output_model_file = os.path.join(save_dir, "model.pt")
-    model.load_state_dict(torch.load(output_model_file))
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Training script for LlamLam")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--output_dir", type=str, default="experiments", help="Output directory")
+    parser.add_argument("--run_name", type=str, default=None, help="Run name")
+    parser.add_argument("--n_layer", type=int, default=12, help="Number of layers")
+    parser.add_argument("--n_head", type=int, default=4, help="Number of heads")
+    parser.add_argument("--head_width", type=int, default=2, help="Width of the head, total dim is head_width * n_head")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")  # 32
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear", help="Type of learning rate scheduler")
+    parser.add_argument("--num_warmup_steps", type=int, default=0, help="Number of warmup steps")
+    args = parser.parse_args()
 
-
-@click.command()
-@click.option("--num_warmup_steps", default=0, help="Number of warmup steps")
-@click.option("--seed", default=42, help="Random seed")
-@click.option("--output_dir", default="experiments", help="Output directory")
-@click.option("--debug", is_flag=True, help="Debug mode")
-@click.option("--run_name", default=None, help="Run name")
-@click.option("--local_rank", default=-1, help="Local rank")
-@click.option("--n_layer", default=12, help="Number of layers")
-@click.option("--n_head", default=4, help="Number of heads")
-@click.option(
-    "--head_width",
-    default=2,
-    help="Width of the head, total dim is head_width * n_head",
-)
-@click.option("--batch_size", default=2048, help="Total training batch size")
-@click.option("--learning_rate", default=1e-3, help="Learning rate")
-@click.option("--weight_decay", default=0.1, help="Weight decay for optimization")
-@click.option("--num_train_epochs", default=1, help="Number of training epochs")
-@click.option(
-    "--lr_scheduler_type", default="linear", help="Type of learning rate scheduler"
-)
-def main(
-    num_warmup_steps,
-    seed,
-    output_dir,
-    local_rank,  # needed for deepspeed
-    debug,
-    run_name,
-    n_layer,
-    n_head,
-    head_width,
-    batch_size,
-    learning_rate,
-    weight_decay,
-    num_train_epochs,
-    lr_scheduler_type,
-):
-
-    # set seed first thing
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
-
-    if run_name is None:
-        run_name = f"LR:{learning_rate}_HeadWidth:{head_width}_TotalBS:{batch_size}_Nhead:{n_head}_NLayer:{n_layer}"
-
-    output_dir = Path(__file__).resolve().parent.parent / "data" / "output" / run_name
-    os.makedirs(output_dir, exist_ok=True)
-
-    device = torch.device(get_accelerator().device_name())  # type: ignore
-
+    # Load default configs
+    model_config = LMConfig()
     train_config = {
-        "train_batch_size": batch_size,
+        "num_epochs": args.num_epochs,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "num_warmup_steps": args.num_warmup_steps,
+        "batch_size": args.batch_size,
         "bfloat16": {"enabled": False},  # True
         "gradient_clipping": 1.0,
     }
 
-    # Initialize WandB
-    wandb.init(
-        name=run_name,
-        config={
-            "seed": seed,
-            "learning_rate": learning_rate,
-            "lr_scheduler_type": lr_scheduler_type,
-            "num_warmup_steps": num_warmup_steps,
-            "weight_decay": weight_decay,
-            "num_train_epochs": num_train_epochs,
-            "head_width": head_width,
-            "Nhead": n_head,
-            "NLayer": n_layer,
-            "output_dir": output_dir,
-        },
-    )
+    # Update configs with parsed arguments
+    for arg_name, arg_value in vars(args).items():
+        if hasattr(model_config, arg_name):
+            setattr(model_config, arg_name, arg_value)
+        elif arg_name in train_config:
+            train_config[arg_name] = arg_value
+    logger.info(f"Arguments parsed: {vars(args)}")
+
+    # Create run directory
+    run_name = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    output_dir = Path(__file__).resolve().parent.parent / "data" / "runs" / run_name
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Run directory created at: {output_dir}")
+
+    # Set seed
+    seed = 137
+    set_seed(seed=seed)
+    logger.info(f"Using seed: {seed}")
+
+    # Choose device
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+
+    ##############################
+    # Initialize tokenizer
+    ##############################
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        # model.config.pad_token_id = model.config.eos_token_id
+    logger.info(f"Tokenizer initialized with vocabulary size: {len(tokenizer)}")
 
-    config = LMConfig(
-        vocab_size=len(tokenizer),
-        max_length=512,
-        n_head=n_head,
-        n_layer=n_layer,
-        n_embd=n_head * head_width,
+    # Update model config with tokenizer vocabulary size
+    model_config.vocab_size = len(tokenizer)
+
+    # Init wandb
+    wandb.init(
+        project="llamlam",
+        name=run_name,
+        config={**model_config.__dict__, **train_config}
     )
 
-    model = GPTModel(config)
-    # model.train()
+    # Save configs to YAML files
+    model_config_path = output_dir / "model_config.yaml"
+    with open(model_config_path, 'w') as f:
+        yaml.dump(model_config.__dict__, f)
+    opt_config_path = output_dir / "train_config.yaml"
+    with open(opt_config_path, 'w') as f:
+        yaml.dump(train_config, f)
+    logger.info(f"Config saved to: {model_config_path} and {opt_config_path}")
 
-    # Declare datasets, samplers, and dataloaders
-    train_dataset = CustomDataset(tokenizer, "train", debug=debug)
-    val_dataset = CustomDataset(tokenizer, "validation", debug=debug)
+    ##############################
+    # Load data, make dataloaders
+    ##############################
+
+    train_dataset = CustomDataset(tokenizer, "train", debug=args.debug)
+    val_dataset = CustomDataset(tokenizer, "validation", debug=args.debug)
 
     train_sampler = RandomSampler(train_dataset)
     val_sampler = SequentialSampler(val_dataset)
@@ -211,78 +146,75 @@ def main(
         train_dataset,
         collate_fn=default_data_collator,
         sampler=train_sampler,
-        batch_size=batch_size,
+        batch_size=train_config["batch_size"],
     )
     val_loader = DataLoader(
         val_dataset,
         collate_fn=default_data_collator,
         sampler=val_sampler,
-        batch_size=batch_size * 2,
+        batch_size=train_config["batch_size"] * 2,
     )
 
-    # Config for no-decay
-    no_decay_name_list = [
-        "bias",
-        "ln_",
-        "ln_f.weight",
-    ]
+    ##############################
+    # Initialize model
+    ##############################
 
-    optimizer_grouped_parameters = []
-    final_optimizer_settings = {}
-    for n, p in model.named_parameters():
-        group_parameters = {}
-        if p.requires_grad:
-            if any(ndnl in n for ndnl in no_decay_name_list):
-                group_parameters["weight_decay"] = 0.0
-            else:
-                group_parameters["weight_decay"] = weight_decay
+    model = GPTModel(model_config)
+    model.to(device)
 
-            # Define learning rate for specific types of params
+    ##############################
+    # Define optimizer
+    ##############################
 
-            is_embed = "embed" in n
-            if "embed" in n or any(ndnl in n for ndnl in no_decay_name_list):
-                group_parameters["lr"] = learning_rate * (3.3 if is_embed else 1.0)
-            else:
-                group_parameters["lr"] = learning_rate * (1 / head_width)
+    optimizer = AdamW(model.parameters(), lr=train_config["learning_rate"], weight_decay=train_config["weight_decay"])
 
-            group_parameters["params"] = [p]
-            final_optimizer_settings[n] = {
-                "lr": group_parameters["lr"],
-                "wd": group_parameters["weight_decay"],
-            }
-            optimizer_grouped_parameters.append(group_parameters)
-
-    # View the settings, see if anything is wrong.
-    with open(os.path.join(output_dir, "opt_config.json"), "w") as json_file:
-        json.dump(final_optimizer_settings, json_file, indent=4)
-
-    optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate, betas=(0.9, 0.95))
-
-    # Define learning rate scheduler
     lr_scheduler = get_scheduler(
-        name=lr_scheduler_type,
+        name=train_config["lr_scheduler_type"],
         optimizer=optimizer,
-        num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_train_epochs * math.ceil(len(train_loader)),
+        num_warmup_steps=train_config["num_warmup_steps"],
+        num_training_steps=train_config["num_epochs"] * math.ceil(len(train_loader)),
     )
+    logger.info(f"Optimizer initialized with config: {train_config}")
 
-    # Initialize distributed backend
-    model_engine, optimizer, _, lr_scheduler = deepspeed.initialize(
-        model=model, config=train_config, lr_scheduler=lr_scheduler, optimizer=optimizer
-    )
+    ##############################
+    # Train
+    ##############################
 
-    # Training loop
-    for epoch in range(num_train_epochs):
-        avg_train_loss = train(model_engine, train_loader, model_engine.device)
-        val_loss, perp = validate(model_engine, val_loader, device=device)
-        logger.info(
-            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
-        )
-        wandb.log({"ppl": perp, "loss": val_loss, "epoch": epoch})
+    eval_step = 100
 
-        model_output_dir = os.path.join(output_dir, f"step_{epoch}_final")
-        save_model(model_engine, model_output_dir)
+    tokens_seen = 0
+    global_step = -1
 
+    for epoch in range(train_config["num_epochs"]):
+        train_loss = 0.
+        for batch in train_loader:
 
-if __name__ == "__main__":
-    main()
+            model.train()
+            optimizer.zero_grad()  # reset gradients
+            input_ids = batch["input_ids"].to(device)
+            loss = model(input_ids)["loss"]  # logits, (loss), (hidden_states)
+            loss.backward()  # calculate loss gradients
+            optimizer.step()  # update model parameters
+
+            wandb.log({"train_loss": loss.item()})  # log train loss to wandb after each batch
+            train_loss += loss.item()
+            tokens_seen += input_ids.numel()
+            global_step += 1
+
+            if global_step % eval_step == 0:
+                val_loss, perplexity = eval_model(model, val_loader, device)
+                logger.info(f"Epoch {epoch+1} (Step {global_step:06d}): validation loss {val_loss:.3f}")
+
+        avg_train_loss = train_loss / len(train_loader)
+        val_loss, perplexity = eval_model(model, val_loader, device)
+        logger.info(f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}")
+        # log validation loss and metric to wandb after each epoch
+        wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
+
+        # model_output_dir = os.path.join(output_dir, f"step_{epoch}_final")
+        # save_model(model_engine, model_output_dir)
+
+        # # Print a sample text after each epoch
+        # generate_and_print_sample(
+        #     model, tokenizer, device, start_context
+        # )

@@ -3,16 +3,7 @@ import torch.nn as nn
 import torch.nn.init as init
 from torch.nn import functional as F
 
-from activation import GELU
-
-
-class LMConfig:
-    def __init__(self, vocab_size, max_length, n_layer, n_head, n_embd):
-        self.vocab_size = vocab_size
-        self.max_length = max_length
-        self.n_layer = n_layer
-        self.n_head = n_head
-        self.n_embd = n_embd
+from llamlam.activation import GELU
 
 
 class Attention(nn.Module):
@@ -138,8 +129,8 @@ class GPTModel(nn.Module):
 
         x = self.ln_f(x)
         logits = self.head(x).float()
-
         outputs = {"logits": logits}
+
         if input_ids is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
