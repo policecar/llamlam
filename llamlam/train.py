@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers import AutoTokenizer
 from transformers import default_data_collator, get_scheduler
 
-from llamlam.config import LMConfig
+from llamlam.config import LMConfig, TrainConfig
 from llamlam.data import CustomDataset
 from llamlam.model import GPTModel
 from llamlam.utils import set_seed
@@ -51,18 +51,14 @@ if __name__ == "__main__":
     ##############################
 
     # Set up logging
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     logger = logging.getLogger(__name__)
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Training script for LlamLam")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument(
-        "--output_dir", type=str, default="experiments", help="Output directory"
-    )
+    parser.add_argument("--output_dir", type=str, default="experiments", help="Output directory")
     parser.add_argument("--run_name", type=str, default=None, help="Run name")
     parser.add_argument("--n_layer", type=int, default=12, help="Number of layers")
     parser.add_argument("--n_head", type=int, default=4, help="Number of heads")
@@ -72,51 +68,26 @@ if __name__ == "__main__":
         default=2,
         help="Width of the head, total dim is head_width * n_head",
     )
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training")
+    parser.add_argument("--num_epochs", type=int, default=3, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument(
-        "--batch_size", type=int, default=8, help="Batch size for training"
-    )  # 32
-    parser.add_argument(
-        "--num_epochs", type=int, default=3, help="Number of training epochs"
+        "--lr_scheduler_type", type=str, default="linear", help="Type of learning rate scheduler"
     )
-    parser.add_argument(
-        "--learning_rate", type=float, default=5e-5, help="Learning rate"
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.01,
-        help="Weight decay for AdamW optimizer",
-    )
-    parser.add_argument(
-        "--lr_scheduler_type",
-        type=str,
-        default="linear",
-        help="Type of learning rate scheduler",
-    )
-    parser.add_argument(
-        "--num_warmup_steps", type=int, default=0, help="Number of warmup steps"
-    )
+    parser.add_argument("--num_warmup_steps", type=int, default=0, help="Number of warmup steps")
     args = parser.parse_args()
 
     # Load default configs
     model_config = LMConfig()
-    train_config = {
-        "num_epochs": args.num_epochs,
-        "learning_rate": args.learning_rate,
-        "weight_decay": args.weight_decay,
-        "lr_scheduler_type": args.lr_scheduler_type,
-        "num_warmup_steps": args.num_warmup_steps,
-        "batch_size": args.batch_size,
-        "bfloat16": {"enabled": False},  # True
-        "gradient_clipping": 1.0,
-    }
+    train_config = TrainConfig()
 
     # Update configs with parsed arguments
     for arg_name, arg_value in vars(args).items():
         if hasattr(model_config, arg_name):
             setattr(model_config, arg_name, arg_value)
-        elif arg_name in train_config:
-            train_config[arg_name] = arg_value
+        elif hasattr(train_config, arg_name):
+            setattr(train_config, arg_name, arg_value)
     logger.info(f"Arguments parsed: {vars(args)}")
 
     # Create run directory
@@ -155,7 +126,7 @@ if __name__ == "__main__":
     wandb.init(
         project="llamlam",
         name=run_name,
-        config={**model_config.__dict__, **train_config},
+        config={**model_config.__dict__, **train_config.__dict__},
     )
 
     # Save configs to YAML files
@@ -181,13 +152,13 @@ if __name__ == "__main__":
         train_dataset,
         collate_fn=default_data_collator,
         sampler=train_sampler,
-        batch_size=train_config["batch_size"],
+        batch_size=train_config.batch_size,
     )
     val_loader = DataLoader(
         val_dataset,
         collate_fn=default_data_collator,
         sampler=val_sampler,
-        batch_size=train_config["batch_size"] * 2,
+        batch_size=train_config.batch_size * 2,
     )
 
     ##############################
@@ -202,16 +173,14 @@ if __name__ == "__main__":
     ##############################
 
     optimizer = AdamW(
-        model.parameters(),
-        lr=train_config["learning_rate"],
-        weight_decay=train_config["weight_decay"],
+        model.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay
     )
 
     lr_scheduler = get_scheduler(
-        name=train_config["lr_scheduler_type"],
+        name=train_config.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=train_config["num_warmup_steps"],
-        num_training_steps=train_config["num_epochs"] * math.ceil(len(train_loader)),
+        num_warmup_steps=train_config.num_warmup_steps,
+        num_training_steps=train_config.num_epochs * math.ceil(len(train_loader)),
     )
     logger.info(f"Optimizer initialized with config: {train_config}")
 
@@ -225,7 +194,7 @@ if __name__ == "__main__":
     tokens_seen = 0
     global_step = -1
 
-    for epoch in range(train_config["num_epochs"]):
+    for epoch in range(train_config.num_epochs):
         train_loss = 0.0
         for batch in train_loader:
 
@@ -236,9 +205,7 @@ if __name__ == "__main__":
             loss.backward()  # calculate loss gradients
             optimizer.step()  # update model parameters
 
-            wandb.log(
-                {"train_loss": loss.item()}
-            )  # log train loss to wandb after each batch
+            wandb.log({"train_loss": loss.item()})  # log train loss to wandb after each batch
             train_loss += loss.item()
             tokens_seen += input_ids.numel()
             global_step += 1
@@ -255,16 +222,12 @@ if __name__ == "__main__":
 
         avg_train_loss = train_loss / len(train_loader)
         val_loss, perplexity = eval_model(model, val_loader, device)
-        logger.info(
-            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
-        )
+        logger.info(f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}")
         # log validation loss and metric to wandb after each epoch
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 
         # save model at end of each epoch
-        model.save_pretrained(
-            output_dir, f"epoch_{epoch}_step_{global_step}", optimizer
-        )
+        model.save_pretrained(output_dir, f"epoch_{epoch}_step_{global_step}", optimizer)
 
         # After each epoch, print a sample text
         # model = GPTModel.from_pretrained(

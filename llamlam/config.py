@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -8,6 +8,22 @@ class LMConfig:
     n_layer: int = 12  # number of layers
     n_head: int = 12  # number of heads
     head_width: int = 64  # width of each attention head
-    n_embd: int = n_head * head_width  # embedding dimension TODO: rename to embed_dim
+    n_embd: int = field(init=False)  # embedding dimension TODO: rename to embed_dim
     # dropout: float = 0.1                # dropout rate
     # qkv_bias: bool = True               # use bias in qkv projection
+
+    def __post_init__(self):
+        self.n_embd = self.n_head * self.head_width
+
+
+@dataclass
+class TrainConfig:
+    seed: int = 137
+    num_epochs: int = 3
+    learning_rate: float = 5e-5
+    weight_decay: float = 0.01
+    lr_scheduler_type: str = "linear"
+    num_warmup_steps: int = 0
+    batch_size: int = 8  # 32
+    bfloat16: dict[str, bool] = field(default_factory=lambda: {"enabled": False})
+    gradient_clipping: float = 1.0

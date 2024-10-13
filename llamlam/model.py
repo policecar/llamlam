@@ -15,9 +15,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = embed_dim // n_heads
 
-        assert (
-            self.head_dim * n_heads == embed_dim
-        ), "embed_dim must be divisible by n_heads"
+        assert self.head_dim * n_heads == embed_dim, "embed_dim must be divisible by n_heads"
 
         # Scale factor for dot product attention
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -51,9 +49,7 @@ class Attention(nn.Module):
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
         )
-        attn_output = attn_output.transpose(1, 2).reshape(
-            batch_size, seq_length, self.embed_dim
-        )
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, self.embed_dim)
         output = self.out_proj(attn_output)
         return output
 
@@ -113,9 +109,7 @@ class GPTModel(nn.Module):
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(
-            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
-        )
+        position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         hidden_states = []
@@ -136,9 +130,7 @@ class GPTModel(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
 
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
+            loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
             outputs["loss"] = loss
 
         if output_hidden_states:
@@ -208,9 +200,7 @@ class GPTModel(nn.Module):
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
 
                 # Append sampled index to the running sequence
-                token_ids = torch.cat(
-                    (token_ids, idx_next), dim=1
-                )  # (batch, n_tokens+1)
+                token_ids = torch.cat((token_ids, idx_next), dim=1)  # (batch, n_tokens+1)
 
         # Decode and return the generated text
         return tokenizer.decode(token_ids[0], skip_special_tokens=True)

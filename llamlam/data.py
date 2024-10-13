@@ -9,9 +9,7 @@ class CustomDataset(Dataset):
         else:
             vernum = 103
         self.vernum = vernum
-        self.dataset = load_dataset(
-            "wikitext", f"wikitext-{vernum}-raw-v1", split=type_path
-        )
+        self.dataset = load_dataset("wikitext", f"wikitext-{vernum}-raw-v1", split=type_path)
         self.tokenizer = tokenizer
         self.max_length = max_length
 
