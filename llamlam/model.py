@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -144,3 +145,72 @@ class GPTModel(nn.Module):
             outputs["hidden_states"] = hidden_states
 
         return outputs
+
+    def save_pretrained(self, output_dir, tag, optimizer=None):
+        os.makedirs(output_dir, exist_ok=True)
+        torch.save(self.state_dict(), output_dir / f"model_{tag}.pt")
+        if optimizer is not None:
+            torch.save(optimizer.state_dict(), output_dir / f"optimizer_{tag}.pt")
+
+    @classmethod
+    def from_pretrained(cls, config, args):
+        model = cls(config)
+        model.load_state_dict(torch.load(args["model_name_or_path"]))
+        model.eval()
+        return model
+
+    def generate(self, tokenizer, prompt, max_new_tokens=100):
+        """
+        Generate text from the model.
+
+        Args:
+            tokenizer: Tokenizer instance
+            prompt: Text to start generation with
+            max_new_tokens: Maximum number of new tokens to generate
+
+        Returns:
+            Decoded text
+        """
+        device = torch.device(
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps" if torch.backends.mps.is_available() else "cpu"
+        )
+
+        self.eval()
+        self.to(device)
+
+        # Encode prompt
+        token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+        # TeuxDeux:
+        # - top_k
+        # - top_p
+        # - temperature
+
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+
+                # Crop current context if it exceeds the supported context size
+                # E.g., if LLM supports only 5 tokens, and the context size is 10
+                # then only the last 5 tokens are used as context
+                idx_cond = token_ids[:, -self.config.max_length :]
+
+                # Get the predictions
+                with torch.no_grad():
+                    logits = self(idx_cond)["logits"]
+
+                # Focus only on the last time step
+                # (batch, n_token, vocab_size) becomes (batch, vocab_size)
+                logits = logits[:, -1, :]
+
+                # Get the idx of the vocab entry with the highest logits value
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
+
+                # Append sampled index to the running sequence
+                token_ids = torch.cat(
+                    (token_ids, idx_next), dim=1
+                )  # (batch, n_tokens+1)
+
+        # Decode and return the generated text
+        return tokenizer.decode(token_ids[0], skip_special_tokens=True)
