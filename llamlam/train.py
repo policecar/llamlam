@@ -3,7 +3,6 @@ import logging
 import math
 import os
 import yaml
-import warnings
 
 from datetime import datetime
 from pathlib import Path
@@ -20,9 +19,6 @@ from llamlam.config import LMConfig, TrainConfig
 from llamlam.data import CustomDataset
 from llamlam.model import GPTModel
 from llamlam.utils import set_seed
-
-
-warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 def eval_model(model, data_loader, device):
