@@ -137,7 +137,7 @@ def test_save_and_load(model, model_config, tmp_path):
 
     # Load the model
     loaded_model = GPTModel(model_config)
-    loaded_model.load_state_dict(torch.load(save_path))
+    loaded_model.load_state_dict(torch.load(save_path, weights_only=True))
 
     # Compare model parameters
     for p1, p2 in zip(model.parameters(), loaded_model.parameters()):
