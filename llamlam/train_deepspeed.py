@@ -1,55 +1,36 @@
+"""
+Based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
+without distributed training (zero optimization, etc.)
+
+Usage:
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+deepspeed --num_gpus $(nvidia-smi -L | wc -l) llamlam/train.py --batch_size 16 --learning_rate 1e-5 --run_name "test"
+
+ran: deepspeed --num_gpus $(nvidia-smi -L | wc -l) llamlam/train.py --learning_rate 1e-4 --head_width 32 --run_name "test"
+     with default batch_size 16
+
+"""
+
 import json
 import math
-import numpy as np
 import os
-import random
 
 import click
 import deepspeed
 import torch
 import wandb
 
-from datasets import load_dataset
+from pathlib import Path
+
 from deepspeed import get_accelerator
 from deepspeed.utils import logger
-from pathlib import Path
 from torch.optim.adamw import AdamW
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from transformers import AutoTokenizer, default_data_collator, get_scheduler
 
-from model import LMConfig, GPTModel
-
-# based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
-# without distributed training (zero optimization, etc.)
-
-
-class CustomDataset(Dataset):
-    def __init__(self, tokenizer, type_path="train", max_length=512, debug=False):
-        if debug:
-            vernum = 2
-        else:
-            vernum = 103
-        self.vernum = vernum
-        self.dataset = load_dataset(
-            "wikitext", f"wikitext-{vernum}-raw-v1", split=type_path
-        )
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return int(len(self.dataset) * 0.1) if (self.vernum == 103) else 32
-
-    def __getitem__(self, idx):
-        text = self.dataset[idx]["text"]
-        # logger.info(text)
-        inputs = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        return {"input_ids": inputs.input_ids.squeeze()}
+from llamlam.data import CustomDataset
+from llamlam.model import LMConfig, GPTModel
+from llamlam.utils import set_seed
 
 
 def train(model_engine, train_loader, device):
@@ -149,11 +130,7 @@ def main(
     lr_scheduler_type,
 ):
 
-    # set seed first thing
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    # torch.cuda.manual_seed_all(seed)
+    set_seed(seed)  # set seed first thing
 
     if run_name is None:
         run_name = f"LR:{learning_rate}_HeadWidth:{head_width}_TotalBS:{batch_size}_Nhead:{n_head}_NLayer:{n_layer}"
