@@ -42,7 +42,7 @@ class Attention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embd // n_head
 
-        assert self.head_dim * n_head == n_embd, "n_embd must be divisible by n_heads"
+        assert self.head_dim * n_head == n_embd, "n_embd must be divisible by n_head"
 
         # Scale factor for dot product attention
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -67,11 +67,11 @@ class Attention(nn.Module):
         qkv = self.qkv_proj(x)
 
         qkv = qkv.reshape(
-            batch_size, seq_length, self.n_heads, 3 * self.head_dim
-        )  # [B, L, n_heads, 3 * d]
+            batch_size, seq_length, self.n_head, 3 * self.head_dim
+        )  # [B, L, n_head, 3 * d]
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_head L d]
 
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
@@ -174,7 +174,7 @@ class GPTModel(nn.Module):
     @classmethod
     def from_pretrained(cls, config, args):
         model = cls(config)
-        model.load_state_dict(torch.load(args["model_name_or_path"]))
+        model.load_state_dict(torch.load(args["model_name_or_path"], weights_only=True))
         model.eval()
         return model
 
