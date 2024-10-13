@@ -144,6 +144,18 @@ def test_save_and_load(model, model_config, tmp_path):
         assert torch.allclose(p1, p2)
 
 
+def test_reproducibility():
+    set_seed(42)
+    config = LMConfig(max_length=128, vocab_size=1000, n_layer=2, n_head=2, head_width=32)
+    model1 = GPTModel(config)
+
+    set_seed(42)
+    model2 = GPTModel(config)
+
+    for p1, p2 in zip(model1.parameters(), model2.parameters()):
+        assert torch.allclose(p1, p2)
+
+
 def test_attention_mask(model):
     batch_size = 2
     seq_length = 10
