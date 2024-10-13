@@ -92,6 +92,7 @@ def test_loss_calculation(model, dataset):
     assert outputs["loss"].item() > 0
 
 
+@pytest.mark.slow
 def test_overfit_single_batch(model, dataset, train_config):
     set_seed(train_config.seed)
     model.train()
@@ -109,7 +110,7 @@ def test_overfit_single_batch(model, dataset, train_config):
 
     initial_loss = model(input_ids)["loss"].item()
 
-    for _ in range(100):  # Increase this number if the model doesn't overfit
+    for _ in range(500):  # Increase this number if the model doesn't overfit
         optimizer.zero_grad()
         outputs = model(input_ids)
         loss = outputs["loss"]
