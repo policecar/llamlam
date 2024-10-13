@@ -36,13 +36,13 @@ class LayerNorm(nn.Module):
 
 class Attention(nn.Module):
 
-    def __init__(self, embed_dim, n_heads, alpha=0.5):
+    def __init__(self, n_embd, n_head, alpha=0.5):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.n_heads = n_heads
-        self.head_dim = embed_dim // n_heads
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
 
-        assert self.head_dim * n_heads == embed_dim, "embed_dim must be divisible by n_heads"
+        assert self.head_dim * n_head == n_embd, "n_embd must be divisible by n_heads"
 
         # Scale factor for dot product attention
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -51,16 +51,16 @@ class Attention(nn.Module):
         # To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.out_proj = nn.Linear(n_embd, n_embd, bias=False)
 
         # Initialization for linear layers
         for name, param in self.qkv_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / embed_dim) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
         for name, param in self.out_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / embed_dim) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
 
     def forward(self, x, mask=None):
         batch_size, seq_length, _ = x.size()
@@ -76,7 +76,7 @@ class Attention(nn.Module):
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
         )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, self.embed_dim)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, self.n_embd)
         output = self.out_proj(attn_output)
         return output
 
