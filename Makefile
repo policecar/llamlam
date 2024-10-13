@@ -2,10 +2,10 @@ install:
 	pip install --upgrade pip && pip install -r requirements.txt
 
 test:
-	python -m pytest -vv *.py
+	python -m pytest -vv tests/*.py
 
 format:
-	black llamlam/*.py
+	black */*.py --line-length=100
 
 lint:
 	ruff check ./llamlam

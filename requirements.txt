@@ -2,6 +2,7 @@ black
 datasets
 deepspeed
 matplotlib
+pytest
 ruff
 transformers
 torch
