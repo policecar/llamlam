@@ -7,6 +7,33 @@ from torch.nn import functional as F
 from llamlam.activation import GELU
 
 
+class LayerNorm(nn.Module):
+    """
+    LayerNorm as described in https://arxiv.org/abs/1607.06450
+    LayerNorm = ((x - mean) / sqrt(variance + epsilon)) * gamma + beta
+
+    Args:
+        ndim: number of dimensions of the input tensor
+        bias: whether to estimate biased or unbiased standard deviation
+        eps: small value to prevent division by zero or very small variance
+    """
+
+    def __init__(self, ndim, bias, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.eps = eps
+
+    def forward(self, input):
+        return F.layer_norm(
+            input,
+            normalized_shape=self.weight.shape,
+            weight=self.weight,
+            bias=self.bias,
+            eps=self.eps,
+        )
+
+
 class Attention(nn.Module):
 
     def __init__(self, embed_dim, n_heads, alpha=0.5):
