@@ -22,7 +22,7 @@ from llamlam.utils import set_seed
 
 
 def eval_model(model, data_loader, device):
-    """Evaluate model on a given dataset."""
+    """Evaluate model on a given dataloader."""
     model.eval()
     val_loss = 0.0
     with torch.no_grad():
@@ -38,6 +38,21 @@ def eval_model(model, data_loader, device):
         perplexity = float("inf")
 
     return val_loss, perplexity
+
+
+def save_checkpoint(model, optimizer, train_config, global_step, val_loss, tag, output_dir):
+    """Save checkpoint to output directory."""
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "model_config": model.config,
+        "train_config": train_config,
+        "iter_num": global_step,
+        "best_val_loss": val_loss,
+    }
+    torch.save(checkpoint, output_dir / f"ckpt_{tag}.pt")
+    logger.info(f"Saved checkpoint at step {global_step}")
+
 
 
 if __name__ == "__main__":
@@ -212,16 +227,8 @@ if __name__ == "__main__":
                     f"Epoch {epoch+1} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
                 if (global_step == 0) or (val_loss < min(val_losses)):
-                    checkpoint = {
-                        "model": model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "model_config": model_config,
-                        "train_config": train_config,
-                        "iter_num": global_step,
-                        "best_val_loss": min(val_losses) if len(val_losses) > 0 else val_loss,
-                    }
-                    torch.save(checkpoint, output_dir / "ckpt_best.pt")
-                    logger.info(f"Saved checkpoint at step {global_step}")
+                    best_val_loss = min(val_losses).item() if len(val_losses) else val_loss
+                    save_checkpoint(model, optimizer, train_config, global_step, best_val_loss, "best", output_dir)
                 val_losses.append(val_loss)
 
         avg_train_loss = train_loss / len(train_loader)
@@ -231,21 +238,16 @@ if __name__ == "__main__":
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 
         # save checkpoint at end of each epoch
-        checkpoint = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "model_config": model_config.__dict__,
-            "train_config": train_config.__dict__,
-            "global_step": global_step,
-            "best_val_loss": min(val_losses).item() if len(val_losses) > 0 else val_loss,
-        }
-        torch.save(checkpoint, output_dir / f"ckpt_epoch_{epoch}_step_{global_step}.pt")
+        save_checkpoint(model, optimizer, train_config, global_step, val_loss, f"{epoch}_step_{global_step}", output_dir)
 
         # After each epoch, print a sample text
         # checkpoint = torch.load(output_dir / "ckpt_best.pt")
-        # model = GPTModel(**checkpoint["model_config"])
+        # from llamlam.model import GPTModel
+        # model = GPTModel(checkpoint["model_config"])
         # model.load_state_dict(checkpoint["model"])
         # model.eval()
+        # from transformers import AutoTokenizer
+        # tokenizer = AutoTokenizer.from_pretrained("gpt2")
         logger.info(model.generate(tokenizer, prompt="Once upon a time"))
 
     wandb.finish()
