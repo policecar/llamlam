@@ -211,9 +211,17 @@ if __name__ == "__main__":
                 logger.info(
                     f"Epoch {epoch+1} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
-                if not len(val_losses) or (val_loss < min(val_losses)):
-                    model.save_pretrained(output_dir, "best", optimizer)
-                    logger.info(f"Saved model checkpoint at step {global_step}")
+                if (global_step == 0) or (val_loss < min(val_losses)):
+                    checkpoint = {
+                        "model": model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "model_config": model_config,
+                        "train_config": train_config,
+                        "iter_num": global_step,
+                        "best_val_loss": min(val_losses) if len(val_losses) > 0 else val_loss,
+                    }
+                    torch.save(checkpoint, output_dir / "ckpt_best.pt")
+                    logger.info(f"Saved checkpoint at step {global_step}")
                 val_losses.append(val_loss)
 
         avg_train_loss = train_loss / len(train_loader)
@@ -222,13 +230,22 @@ if __name__ == "__main__":
         # log validation loss and metric to wandb after each epoch
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 
-        # save model at end of each epoch
-        model.save_pretrained(output_dir, f"epoch_{epoch}_step_{global_step}", optimizer)
+        # save checkpoint at end of each epoch
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "model_config": model_config.__dict__,
+            "train_config": train_config.__dict__,
+            "global_step": global_step,
+            "best_val_loss": min(val_losses).item() if len(val_losses) > 0 else val_loss,
+        }
+        torch.save(checkpoint, output_dir / f"ckpt_epoch_{epoch}_step_{global_step}.pt")
 
         # After each epoch, print a sample text
-        # model = GPTModel.from_pretrained(
-        #     model_config, {"model_name_or_path": output_dir / "model_best.pt"}
-        # )
+        # checkpoint = torch.load(output_dir / "ckpt_best.pt")
+        # model = GPTModel(**checkpoint["model_config"])
+        # model.load_state_dict(checkpoint["model"])
+        # model.eval()
         logger.info(model.generate(tokenizer, prompt="Once upon a time"))
 
     wandb.finish()
