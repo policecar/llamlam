@@ -5,7 +5,7 @@ test:
 	python -m pytest -vv tests/*.py
 
 format:
-	black */*.py --line-length=100
+	ruff format .
 
 lint:
 	ruff check ./llamlam
