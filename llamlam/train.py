@@ -261,18 +261,6 @@ if __name__ == "__main__":
                 step=global_step,
             )
 
-            if global_step % config.eval_steps == 0:
-                val_loss, perplexity = evaluate(
-                    model, val_loader, accelerator=accelerator
-                )
-                logger.info(
-                    f"Epoch {epoch+1} (Step {global_step:06d}): validation loss {val_loss:.3f}"
-                )
-                if (global_step == 1) or (val_loss < min(val_losses)):
-                    best_val_loss = min(val_losses) if len(val_losses) else val_loss
-                    accelerator.save_state(output_dir)
-                val_losses.append(val_loss)
-
         avg_train_loss = train_loss / len(train_loader)
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
         logger.info(
