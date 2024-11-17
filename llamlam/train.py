@@ -26,20 +26,23 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 
 if __name__ == "__main__":
-
     ##########################################
     # Setup
     ##########################################
 
     # Set up logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
     logger = logging.getLogger(__name__)
 
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Training script for LlamLam")
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument("--seed", type=int, help="Random seed")
-    parser.add_argument("--output_dir", type=str, default="experiments", help="Output directory")
+    parser.add_argument(
+        "--output_dir", type=str, default="experiments", help="Output directory"
+    )
     parser.add_argument("--run_name", type=str, help="Run name")
     parser.add_argument("--n_layer", type=int, help="Number of layers")
     parser.add_argument("--n_head", type=int, help="Number of heads")
@@ -179,7 +182,9 @@ if __name__ == "__main__":
     ##########################################
 
     optimizer = AdamW(
-        get_grouped_params(model, weight_decay=config.weight_decay, no_decay=config.no_decay),
+        get_grouped_params(
+            model, weight_decay=config.weight_decay, no_decay=config.no_decay
+        ),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
@@ -257,7 +262,9 @@ if __name__ == "__main__":
             )
 
             if global_step % config.eval_steps == 0:
-                val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
+                val_loss, perplexity = evaluate(
+                    model, val_loader, accelerator=accelerator
+                )
                 logger.info(
                     f"Epoch {epoch+1} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
@@ -268,7 +275,9 @@ if __name__ == "__main__":
 
         avg_train_loss = train_loss / len(train_loader)
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
-        logger.info(f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}")
+        logger.info(
+            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+        )
         # log validation loss and metric to wandb after each epoch
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 

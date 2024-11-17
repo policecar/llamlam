@@ -110,7 +110,9 @@ def load_model(model, save_dir):
 @click.option("--learning_rate", default=1e-3, help="Learning rate")
 @click.option("--weight_decay", default=0.1, help="Weight decay for optimization")
 @click.option("--num_train_epochs", default=1, help="Number of training epochs")
-@click.option("--lr_scheduler_type", default="linear", help="Type of learning rate scheduler")
+@click.option(
+    "--lr_scheduler_type", default="linear", help="Type of learning rate scheduler"
+)
 def main(
     num_warmup_steps,
     seed,
@@ -127,7 +129,6 @@ def main(
     num_train_epochs,
     lr_scheduler_type,
 ):
-
     set_seed(seed)  # set seed first thing
 
     if run_name is None:
@@ -250,7 +251,9 @@ def main(
     for epoch in range(num_train_epochs):
         avg_train_loss = train(model_engine, train_loader, model_engine.device)
         val_loss, perp = validate(model_engine, val_loader, device=device)
-        logger.info(f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}")
+        logger.info(
+            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+        )
         wandb.log({"ppl": perp, "loss": val_loss, "epoch": epoch})
 
         model_output_dir = os.path.join(output_dir, f"step_{epoch}_final")

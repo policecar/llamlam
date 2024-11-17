@@ -1,5 +1,4 @@
 class DataCollator:
-
     def __init__(self, tokenizer, config):
         self.tokenizer = tokenizer
         self.config = config

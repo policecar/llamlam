@@ -35,7 +35,6 @@ class LayerNorm(nn.Module):
 
 
 class Attention(nn.Module):
-
     def __init__(self, n_embd, n_head, alpha=0.5):
         super().__init__()
         self.n_embd = n_embd
@@ -76,13 +75,14 @@ class Attention(nn.Module):
         attn_output = F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
         )
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_length, self.n_embd)
+        attn_output = attn_output.transpose(1, 2).reshape(
+            batch_size, seq_length, self.n_embd
+        )
         output = self.out_proj(attn_output)
         return output
 
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
 
@@ -121,7 +121,6 @@ class Block(nn.Module):
 
 
 class GPTModel(nn.Module):
-
     def __init__(self, config, alpha=0.5):
         super().__init__()
         self.config = config
@@ -138,7 +137,9 @@ class GPTModel(nn.Module):
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(0, input_ids.size(1), dtype=torch.long, device=input_ids.device)
+        position_ids = torch.arange(
+            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
+        )
         position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         hidden_states = []
@@ -159,7 +160,9 @@ class GPTModel(nn.Module):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = input_ids[..., 1:].contiguous()
 
-            loss = self.loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = self.loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
             outputs["loss"] = loss
 
         if output_hidden_states:
@@ -195,7 +198,9 @@ class GPTModel(nn.Module):
         device = torch.device(
             "cuda"
             if torch.cuda.is_available()
-            else "mps" if torch.backends.mps.is_available() else "cpu"
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
         )
 
         self.eval()
@@ -211,7 +216,6 @@ class GPTModel(nn.Module):
 
         with torch.no_grad():
             for _ in range(max_new_tokens):
-
                 # Crop current context if it exceeds the supported context size
                 # E.g., if LLM supports only 5 tokens, and the context size is 10
                 # then only the last 5 tokens are used as context
@@ -229,7 +233,9 @@ class GPTModel(nn.Module):
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
 
                 # Append sampled index to the running sequence
-                token_ids = torch.cat((token_ids, idx_next), dim=1)  # (batch, n_tokens+1)
+                token_ids = torch.cat(
+                    (token_ids, idx_next), dim=1
+                )  # (batch, n_tokens+1)
 
         # Decode and return the generated text
         return tokenizer.decode(token_ids[0], skip_special_tokens=True)

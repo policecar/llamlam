@@ -41,7 +41,7 @@ def sample_data(config):
     return [
         {"input_ids": torch.randint(0, config.vocab_size, (batch_size, seq_length))}
         for _ in range(n_batches)
-    ] # TODO: use real data
+    ]  # TODO: use real data
 
 
 class UniformBaseline(nn.Module):
@@ -53,10 +53,14 @@ class UniformBaseline(nn.Module):
 
     def forward(self, input_ids):
         batch_size, seq_len = input_ids.shape
-        logits = torch.ones(batch_size, seq_len, self.vocab_size, device=input_ids.device)
+        logits = torch.ones(
+            batch_size, seq_len, self.vocab_size, device=input_ids.device
+        )
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
-        loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
         return {"loss": loss, "logits": logits}
 
 
@@ -72,7 +76,9 @@ class UnigramBaseline(nn.Module):
         logits = self.logits.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = input_ids[..., 1:].contiguous()
-        loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        loss = F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
         return {"loss": loss, "logits": logits}
 
 
@@ -195,8 +201,12 @@ def test_generate_coherent_text(model, tokenizer):
     generated_text = model.generate(tokenizer, prompt, max_new_tokens=20)
 
     # Basic coherence checks
-    assert len(generated_text.split()) > len(prompt.split()), "Model failed to generate new tokens"
-    assert generated_text.startswith(prompt), "Generated text does not start with the prompt"
+    assert len(generated_text.split()) > len(
+        prompt.split()
+    ), "Model failed to generate new tokens"
+    assert generated_text.startswith(
+        prompt
+    ), "Generated text does not start with the prompt"
     assert len(set(generated_text.split())) > 1, "Generated text has no variety"
 
     # Additional checks for generation quality

@@ -91,7 +91,9 @@ def get_grouped_params(model, weight_decay=0.1, no_decay=[]):
     return opt_grouped_params
 
 
-def save_checkpoint(model, optimizer, config, global_step, val_loss, tag, output_dir, max_ckpts=3):
+def save_checkpoint(
+    model, optimizer, config, global_step, val_loss, tag, output_dir, max_ckpts=3
+):
     """Save checkpoint to output directory."""
     checkpoint = {
         "model": model.state_dict(),

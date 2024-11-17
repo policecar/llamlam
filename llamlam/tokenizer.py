@@ -3,7 +3,6 @@ import os
 
 
 class Tokenizer:
-
     def __init__(self, vocab_file, unk_token, bos_token, eos_token):
         self.special_tokens = [unk_token, bos_token, eos_token]
         self.vocab_file = vocab_file

@@ -179,7 +179,9 @@ def test_attention_mask(model):
     outputs_without_mask = model(input_ids)
 
     # Outputs should differ when using mask
-    assert not torch.allclose(outputs_with_mask["logits"], outputs_without_mask["logits"])
+    assert not torch.allclose(
+        outputs_with_mask["logits"], outputs_without_mask["logits"]
+    )
 
 
 def test_gradient_flow(model, sample_batch):
