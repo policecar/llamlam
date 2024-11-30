@@ -23,6 +23,7 @@ from llamlam.utils import evaluate, get_grouped_params, set_seed
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["MALLOC_DISABLE_WARNINGS"] = "1"
 
 
 if __name__ == "__main__":
@@ -47,12 +48,12 @@ if __name__ == "__main__":
     parser.add_argument("--n_layer", type=int, help="Number of layers")
     parser.add_argument("--n_head", type=int, help="Number of heads")
     parser.add_argument(
-        "--head_width",
+        "--dim_head",
         type=int,
-        help="Width of the head, total dim is head_width * n_head",
+        help="Dimension of each attention head, total dim is n_head * dim_head",
     )
     parser.add_argument("--batch_size", type=int, help="Batch size for training")
-    parser.add_argument("--num_epochs", type=int, help="Number of training epochs")
+    parser.add_argument("--n_epochs", type=int, help="Number of training epochs")
     parser.add_argument(
         "--eval_steps",
         type=int,
@@ -65,7 +66,7 @@ if __name__ == "__main__":
         type=str,
         help="Type of learning rate scheduler",
     )
-    parser.add_argument("--num_warmup_steps", type=int, help="Number of warmup steps")
+    parser.add_argument("--n_warmup_steps", type=int, help="Number of warmup steps")
     args = parser.parse_args()
 
     # Load default config
@@ -158,7 +159,7 @@ if __name__ == "__main__":
         shuffle=True,
         collate_fn=collate_fn,  # default_data_collator,
         batch_size=config.batch_size,
-        num_workers=config.num_data_workers,
+        num_workers=config.n_data_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
@@ -166,7 +167,7 @@ if __name__ == "__main__":
         shuffle=False,
         collate_fn=collate_fn,
         batch_size=config.batch_size,
-        num_workers=config.num_data_workers,
+        num_workers=config.n_data_workers,
         pin_memory=True,
     )
 
@@ -192,8 +193,8 @@ if __name__ == "__main__":
     lr_scheduler = get_scheduler(
         name=config.lr_scheduler_type,
         optimizer=optimizer,
-        num_warmup_steps=config.num_warmup_steps,
-        num_training_steps=config.num_epochs
+        num_warmup_steps=config.n_warmup_steps,
+        num_training_steps=config.n_epochs
         * len(train_loader)
         // config.gradient_accumulation_steps,
     )
@@ -215,7 +216,7 @@ if __name__ == "__main__":
     # TODO: add resumption of training from a checkpoint
     # https://github.com/huggingface/accelerate/blob/main/examples/complete_nlp_example.py#L175
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(config.n_epochs):
         train_loss = 0.0
         optimizer.zero_grad()  # reset gradients
         for step, batch in enumerate(train_loader):

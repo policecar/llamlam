@@ -83,7 +83,7 @@ def get_grouped_params(model, weight_decay=0.1, no_decay=[]):
             # if "embed" in n or any(nd in n for nd in no_decay):
             #     group_parameters["lr"] = learning_rate * (3.3 if is_embed else 1.0)
             # else:
-            #     group_parameters["lr"] = learning_rate * (1 / head_width)
+            #     group_parameters["lr"] = learning_rate * (1 / dim_head)
 
             group_parameters["params"] = [p]
             opt_grouped_params.append(group_parameters)

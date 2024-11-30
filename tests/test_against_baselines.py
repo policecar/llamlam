@@ -11,11 +11,11 @@ from llamlam.model import GPTModel
 @pytest.fixture
 def config():
     return Config(
-        max_length=16,
+        max_seq_length=16,
         vocab_size=100,
-        n_layer=2,
-        n_head=2,
-        head_width=8,
+        n_layers=2,
+        n_heads=2,
+        dim_head=8,
         dropout=0.0,  # Disable dropout for testing
     )
 

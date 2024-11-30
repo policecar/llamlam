@@ -20,7 +20,9 @@ class GELU(nn.Module):
         self.const = math.sqrt(2.0 / math.pi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return 0.5 * x * (1 + torch.tanh(self.const * (x + 0.044715 * torch.pow(x, 3.0))))
+        return (
+            0.5 * x * (1 + torch.tanh(self.const * (x + 0.044715 * torch.pow(x, 3.0))))
+        )
 
 
 class SwiGLU(nn.Module):

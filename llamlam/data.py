@@ -18,7 +18,7 @@ class DataCollator:
             batch = self.tokenizer(
                 examples,
                 padding="max_length",
-                max_length=self.config.max_length,
+                max_length=self.config.max_seq_length,
                 truncation=True,
                 return_tensors="pt",
             )

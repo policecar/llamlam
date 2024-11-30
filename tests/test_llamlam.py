@@ -10,11 +10,11 @@ from llamlam.utils import set_seed
 @pytest.fixture
 def config():
     return Config(
-        max_length=128,
+        max_seq_length=128,
         vocab_size=50257,
-        n_layer=4,
-        n_head=4,
-        head_width=16,
+        n_layers=4,
+        n_heads=4,
+        dim_head=16,
     )
 
 
@@ -22,7 +22,7 @@ def config():
 def train_config():
     return Config(
         seed=42,
-        num_epochs=3,
+        n_epochs=3,
         learning_rate=5e-4,
         weight_decay=0.01,
         batch_size=4,
@@ -45,7 +45,7 @@ def model(config):
 @pytest.fixture
 def sample_batch(config):
     batch_size = 2
-    seq_length = 64  # Shorter than max_length for testing efficiency
+    seq_length = 64  # Shorter than max_seq_length for testing efficiency
     return {
         "input_ids": torch.randint(0, config.vocab_size, (batch_size, seq_length)),
         "attention_mask": torch.ones(batch_size, seq_length),
@@ -58,16 +58,16 @@ def test_model_initialization(config):
 
     # Test basic model structure
     assert isinstance(model, GPTModel)
-    assert model.config.n_layer == config.n_layer
-    assert model.config.n_head == config.n_head
-    assert model.config.head_width == config.head_width
-    assert model.config.n_embd == config.n_head * config.head_width
+    assert model.config.n_layers == config.n_layers
+    assert model.config.n_heads == config.n_heads
+    assert model.config.dim_head == config.dim_head
+    assert model.config.dim_embd == config.n_heads * config.dim_head
 
     # Test component dimensions
-    assert model.embed.weight.shape == (config.vocab_size, config.n_embd)
-    assert model.pos_embed.shape == (1, config.max_length, config.n_embd)
-    assert model.head.weight.shape == (config.vocab_size, config.n_embd)
-    assert len(model.blocks) == config.n_layer
+    assert model.embed.weight.shape == (config.vocab_size, config.dim_embd)
+    assert model.pos_embed.shape == (1, config.max_seq_length, config.dim_embd)
+    assert model.head.weight.shape == (config.vocab_size, config.dim_embd)
+    assert len(model.blocks) == config.n_layers
 
 
 def test_forward_pass(model, sample_batch):
@@ -210,12 +210,12 @@ def test_hidden_states_output(model, sample_batch):
     hidden_states = outputs["hidden_states"]
 
     # Check number of hidden states (input + one per layer)
-    assert len(hidden_states) == model.config.n_layer + 1
+    assert len(hidden_states) == model.config.n_layers + 1
 
     # Check dimensions of each hidden state
     batch_size, seq_length = sample_batch["input_ids"].shape
     for hidden_state in hidden_states:
-        assert hidden_state.shape == (batch_size, seq_length, model.config.n_embd)
+        assert hidden_state.shape == (batch_size, seq_length, model.config.dim_embd)
 
 
 if __name__ == "__main__":

@@ -35,48 +35,50 @@ class LayerNorm(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, n_embd, n_head, alpha=0.5):
+    def __init__(self, dim_embd, n_heads, alpha=0.5):
         super().__init__()
-        self.n_embd = n_embd
-        self.n_head = n_head
-        self.head_dim = n_embd // n_head
 
-        assert self.head_dim * n_head == n_embd, "n_embd must be divisible by n_head"
+        self.dim_embd = dim_embd
+        self.n_heads = n_heads
+        self.dim_head = dim_embd // n_heads  # because efficiency
+        assert (
+            self.dim_head * n_heads == dim_embd
+        ), "dim_head should be dim_embd // n_heads because efficiency"
 
         # Scale factor for dot product attention
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
         # "We suspect that for large values of d_k, the dot products grow large in magnitude,
-        # pushing the softmax function into regions where it has extremely small gradients.
-        # To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
-        self.scaling = self.head_dim**-0.5
+        #  pushing the softmax function into regions where it has extremely small gradients.
+        #  To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
+        self.scaling = self.dim_head**-0.5  # not used
 
-        self.qkv_proj = nn.Linear(n_embd, 3 * n_embd, bias=False)
-        self.out_proj = nn.Linear(n_embd, n_embd, bias=False)
+        self.qkv_proj = nn.Linear(dim_embd, 3 * dim_embd, bias=False)
+        self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
 
         # Initialization for linear layers
         for name, param in self.qkv_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
         for name, param in self.out_proj.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / n_embd) ** 0.5)
+                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
 
     def forward(self, x, mask=None):
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
         qkv = qkv.reshape(
-            batch_size, seq_length, self.n_head, 3 * self.head_dim
-        )  # [B, L, n_head, 3 * d]
+            batch_size, seq_length, self.n_heads, 3 * self.dim_head
+        )  # [B, L, n_heads, 3 * d]
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_head L d]
+        q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
 
         attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.head_dim
+            q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
         )
         attn_output = attn_output.transpose(1, 2).reshape(
-            batch_size, seq_length, self.n_embd
+            batch_size, seq_length, self.dim_embd
         )
         output = self.out_proj(attn_output)
         return output
@@ -86,29 +88,29 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.attention = Attention(config.n_embd, config.n_head)
+        self.attention = Attention(config.dim_embd, config.n_heads)
 
         self.feedforward = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd),
+            nn.Linear(config.dim_embd, 4 * config.dim_embd),
             GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
+            nn.Linear(4 * config.dim_embd, config.dim_embd),
         )
         for name, param in self.feedforward.named_parameters():
             if "weight" in name:
-                init.normal_(param, mean=0, std=0.5 * (1 / config.n_embd) ** 0.5)
+                init.normal_(param, mean=0, std=0.5 * (1 / config.dim_embd) ** 0.5)
             else:
                 init.zeros_(param)
 
         # Alternative implementation using Conv1D
         # self.feedforward = nn.Sequential(
-        #     nn.Conv1D(config.n_embd, 4 * config.n_embd),
+        #     nn.Conv1D(config.dim_embd, 4 * config.dim_embd),
         #     GELU(),
-        #     nn.Conv1D(4 * config.n_embd, config.n_embd),
+        #     nn.Conv1D(4 * config.dim_embd, config.dim_embd),
         # )
 
         self.dropout = nn.Dropout(p=config.dropout)
-        self.norm_1 = LayerNorm(config.n_embd, bias=config.bias, eps=1e-5)
-        self.norm_2 = LayerNorm(config.n_embd, bias=config.bias, eps=1e-5)
+        self.norm_1 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
+        self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
     def forward(self, x):
         attn = self.attention(self.norm_1(x))
@@ -124,16 +126,18 @@ class GPTModel(nn.Module):
     def __init__(self, config, alpha=0.5):
         super().__init__()
         self.config = config
-        self.embed = nn.Embedding(config.vocab_size, config.n_embd)
-        self.pos_embed = nn.Parameter(torch.zeros(1, config.max_length, config.n_embd))
-        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
-        self.ln_f = nn.LayerNorm(config.n_embd)
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.embed = nn.Embedding(config.vocab_size, config.dim_embd)
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, config.max_seq_length, config.dim_embd)
+        )
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
+        self.ln_f = nn.LayerNorm(config.dim_embd)
+        self.head = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
         self.loss_fn = nn.CrossEntropyLoss()
         self.bias = config.bias
         self.dropout = config.dropout
 
-        init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.n_embd))
+        init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
@@ -219,7 +223,7 @@ class GPTModel(nn.Module):
                 # Crop current context if it exceeds the supported context size
                 # E.g., if LLM supports only 5 tokens, and the context size is 10
                 # then only the last 5 tokens are used as context
-                idx_cond = token_ids[:, -self.config.max_length :]
+                idx_cond = token_ids[:, -self.config.max_seq_length :]
 
                 # Get the predictions
                 with torch.no_grad():

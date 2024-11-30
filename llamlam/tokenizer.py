@@ -21,7 +21,7 @@ class Tokenizer:
         os.makedirs(save_directory, exist_ok=True)
         tokenizer_config = {
             "vocab_size": self.vocab_size,
-            "max_length": self.max_length,
+            "max_seq_length": self.max_seq_length,
         }
         with open(os.path.join(save_directory, "tokenizer_config.json"), "w") as f:
             json.dump(tokenizer_config, f)
