@@ -40,15 +40,15 @@ class Config:
     # Training config
     n_epochs: int = 3
     eval_steps: int = 200
-    learning_rate: float = 1e-4  # 5e-5
+    learning_rate: float = 6e-4  # [6e-4, 6e-5]
+    batch_size: int = 4  # 32
+    gradient_accumulation_steps: int = 8
     weight_decay: float = 0.01
     no_decay: list[str] = field(default_factory=lambda: ["bias", "LayerNorm.weight"])
     lr_scheduler_type: str = "linear"
     n_warmup_steps: int = 100               # int([0.01, 0.2] * total_steps)
-    batch_size: int = 8  # 32
     bfloat16: dict[str, bool] = field(default_factory=lambda: {"enabled": False})
     gradient_clipping: float = 1.0
-    gradient_accumulation_steps: int = 1
 
 
     def __post_init__(self):

@@ -17,7 +17,8 @@ from transformers import AutoTokenizer, get_scheduler
 
 from llamlam.config import Config
 from llamlam.data import DataCollator
-from llamlam.model import GPTModel
+
+from llamlam.difftransformer import DiffTransformer
 from llamlam.utils import evaluate, get_grouped_params, set_seed
 
 
@@ -103,7 +104,7 @@ if __name__ == "__main__":
     ##########################################
 
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.model_max_length = config.max_length
+    tokenizer.model_max_length = config.max_seq_length
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         # model.config.pad_token_id = model.config.eos_token_id
@@ -172,10 +173,11 @@ if __name__ == "__main__":
     )
 
     ##########################################
-    # Initialize model
+    # Instantiate model
     ##########################################
 
-    model = GPTModel(config)
+    model = DiffTransformer(config)
+    # model = GPTModel(config)
     # model.to(device)
 
     ##########################################
@@ -274,10 +276,10 @@ if __name__ == "__main__":
         accelerator.save_state(output_dir)
 
         # After each epoch, print a sample text
-        # checkpoint = torch.load(output_dir / "ckpt_best.pt")
-        # from llamlam.model import GPTModel
-        # model = GPTModel(checkpoint["model_config"])
-        # model.load_state_dict(checkpoint["model"])
+        # from safetensors.torch import load_file
+        # checkpoint = load_file(output_dir / "model.safetensors")
+        # model = Model(checkpoint["model_config"])
+        # model.load_state_dict(checkpoint)
         # model.eval()
         # from transformers import AutoTokenizer
         # tokenizer = AutoTokenizer.from_pretrained("gpt2")
