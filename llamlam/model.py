@@ -34,7 +34,7 @@ class LayerNorm(nn.Module):
         )
 
 
-class Attention(nn.Module):
+class Context(nn.Module):
     def __init__(self, dim_embd, n_heads, alpha=0.5):
         super().__init__()
 
@@ -88,7 +88,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.attention = Attention(config.dim_embd, config.n_heads)
+        self.context = Context(config.dim_embd, config.n_heads)
 
         self.feedforward = nn.Sequential(
             nn.Linear(config.dim_embd, 4 * config.dim_embd),
@@ -113,7 +113,7 @@ class Block(nn.Module):
         self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
     def forward(self, x):
-        attn = self.attention(self.norm_1(x))
+        attn = self.context(self.norm_1(x))
         attn = self.dropout(attn)
         x = x + attn
         mlp = self.feedforward(self.norm_2(x))
