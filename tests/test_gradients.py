@@ -118,8 +118,10 @@ def test_gradient_clipping(model):
     # Get the original gradient norm
     original_norm = nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
 
-    # Reset gradients
+    # Reset gradients and recompute
     model.zero_grad()
+    output = model(input_ids)
+    loss = output["loss"]
     loss.backward()
 
     # Clip gradients

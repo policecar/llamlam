@@ -96,7 +96,7 @@ def test_extremely_large_learning_rate(model):
     loss.backward()
     optimizer.step()
 
-    final_loss = model(input_ids)["loss"].item()
+    final_loss = model(input_ids)["loss"]
 
     assert not torch.isfinite(
         final_loss

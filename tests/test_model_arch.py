@@ -50,7 +50,7 @@ def test_attention_structure(config):
 def test_block_structure(config):
     block = Block(config)
 
-    assert isinstance(block.attention, Attention)
+    assert isinstance(block.context, Context)
     assert isinstance(block.feedforward, nn.Sequential)
     assert len(block.feedforward) == 3
     assert isinstance(block.feedforward[0], nn.Linear)

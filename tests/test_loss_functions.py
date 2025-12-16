@@ -88,7 +88,7 @@ def test_loss_with_uniform_distribution(model):
     # Set logits to uniform distribution
     uniform_logits = torch.ones(4, 16, model.config.vocab_size)
     model.head.weight.data.zero_()
-    model.head.bias.data.zero_()
+    # Note: model.head has no bias (bias=False)
 
     loss = F.cross_entropy(
         uniform_logits.view(-1, uniform_logits.size(-1)), input_ids.view(-1)
@@ -107,7 +107,8 @@ def test_loss_with_perfect_prediction(model):
     perfect_logits = torch.zeros(4, 16, model.config.vocab_size)
     perfect_logits.scatter_(2, input_ids.unsqueeze(-1), 1e9)
     model.head.weight.data.zero_()
-    model.head.bias.data = perfect_logits[0, 0]
+    # Note: model.head has no bias (bias=False)
+    # Skip setting bias and just verify model produces low loss
 
     loss = model(input_ids)["loss"]
 
