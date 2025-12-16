@@ -4,6 +4,9 @@ install:
 test:
 	python -m pytest -vv tests/*.py
 
+smoke-test:
+	python -m llamlam.smoke_test
+
 format:
 	ruff format .
 

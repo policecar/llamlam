@@ -20,8 +20,44 @@ pre-commit install
 
 ## Usage
 
-```
+### Training
+
+```bash
 python -m llamlam.train
+```
+
+### Quick Smoke Test
+
+Run a fast smoke test (~1-2 minutes) to verify the training pipeline works:
+
+```bash
+make smoke-test
+# or
+python -m llamlam.smoke_test
+```
+
+This runs a minimal training loop with:
+- Tiny 2-layer model (~1M parameters)
+- 1000 training samples from WikiText-2
+- 100 training steps
+- Verifies loss decreases and no NaN/Inf values
+
+Use this to quickly test changes before running full training.
+
+## Development
+
+```bash
+# Run tests
+make test
+
+# Run smoke test
+make smoke-test
+
+# Format code
+make format
+
+# Lint code
+make lint
 ```
 
 ## TeuxDeux
