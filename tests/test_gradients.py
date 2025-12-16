@@ -35,6 +35,7 @@ def test_attention_gradient(small_config):
 def test_block_gradient(small_config):
     block = Block(small_config)
     block.double()
+    block.eval()  # Disable dropout for gradient checking
 
     input = torch.randn(
         2, 16, small_config.dim_embd, dtype=torch.double, requires_grad=True
@@ -85,6 +86,7 @@ def test_learning_rate_sensitivity(model):
 
 
 def test_gradient_accumulation(model):
+    model.eval()  # Disable dropout for deterministic behavior
     input_ids = torch.randint(0, 100, (8, 16))
 
     # Single large batch
