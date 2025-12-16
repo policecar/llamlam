@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 from llamlam.config import Config
-from llamlam.model import GPTModel, Context, Block
+from llamlam.model import GPTModel, Context, Block, LayerNorm
 
 
 @pytest.fixture
@@ -57,8 +57,8 @@ def test_block_structure(config):
     assert isinstance(block.feedforward[1], nn.Module)  # GELU
     assert isinstance(block.feedforward[2], nn.Linear)
 
-    assert isinstance(block.norm_1, nn.LayerNorm)
-    assert isinstance(block.norm_2, nn.LayerNorm)
+    assert isinstance(block.norm_1, LayerNorm)
+    assert isinstance(block.norm_2, LayerNorm)
 
 
 def test_model_output_shape(model):

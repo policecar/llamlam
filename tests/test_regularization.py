@@ -97,13 +97,16 @@ def test_layer_norm(model):
 def test_weight_initialization(model):
     for name, param in model.named_parameters():
         if "weight" in name:
-            if "norm" not in name:  # Skip LayerNorm weights
+            # Skip LayerNorm weights (initialized to 1.0 by default)
+            if "norm" not in name and not name.startswith("ln_"):
                 assert param.mean().abs() < 0.1, f"Weight {name} has high mean"
                 # Model uses custom initialization with alpha * (1/dim_embd)**0.5
                 # which gives smaller std values (0.05 - 0.5 range)
                 assert 0.01 < param.std() < 2, f"Weight {name} has unusual std: {param.std()}"
         elif "bias" in name:
-            assert param.mean().abs() < 0.1, f"Bias {name} has high mean"
+            # Skip LayerNorm biases (initialized to 0.0 by default, which is fine)
+            if "norm" not in name and not name.startswith("ln_"):
+                assert param.mean().abs() < 0.1, f"Bias {name} has high mean"
 
 
 def test_overfitting_small_dataset(model):
