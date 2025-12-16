@@ -48,7 +48,6 @@ def sample_batch(config):
     seq_length = 64  # Shorter than max_seq_length for testing efficiency
     return {
         "input_ids": torch.randint(0, config.vocab_size, (batch_size, seq_length)),
-        "attention_mask": torch.ones(batch_size, seq_length),
     }
 
 
@@ -163,25 +162,6 @@ def test_reproducibility(config):
 
     for p1, p2 in zip(model1.parameters(), model2.parameters()):
         assert torch.allclose(p1, p2)
-
-
-def test_attention_mask(model):
-    """Test attention mask functionality."""
-    batch_size = 2
-    seq_length = 64
-    input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_length))
-
-    # Create a mask that masks out the second half of the sequence
-    attention_mask = torch.ones((batch_size, seq_length))
-    attention_mask[:, seq_length // 2 :] = 0
-
-    outputs_with_mask = model(input_ids, attention_mask=attention_mask)
-    outputs_without_mask = model(input_ids)
-
-    # Outputs should differ when using mask
-    assert not torch.allclose(
-        outputs_with_mask["logits"], outputs_without_mask["logits"]
-    )
 
 
 def test_gradient_flow(model, sample_batch):

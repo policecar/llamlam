@@ -3,13 +3,13 @@ import torch
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 
-from llamlam.config import LMConfig
+from llamlam.config import Config
 from llamlam.model import GPTModel
 
 
 @pytest.fixture
 def model():
-    config = LMConfig(max_length=16, vocab_size=100, n_layer=2, n_head=2, head_width=8)
+    config = Config(max_seq_length=16, vocab_size=100, n_layers=2, n_heads=2, dim_head=8)
     return GPTModel(config)
 
 

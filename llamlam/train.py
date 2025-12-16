@@ -230,7 +230,7 @@ if __name__ == "__main__":
             accelerator.backward(loss)  # calculate loss gradients, loss.backward()
             # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            if step % config.gradient_accumulation_steps == 0:
+            if (step + 1) % config.gradient_accumulation_steps == 0:
                 optimizer.step()  # update model parameters
                 lr_scheduler.step()  # update learning rate
                 optimizer.zero_grad()  # reset gradients
@@ -247,8 +247,9 @@ if __name__ == "__main__":
                 logger.info(
                     f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
-                if (global_step == 0) or (val_loss < min(val_losses)):
-                    best_val_loss = min(val_losses) if len(val_losses) else val_loss
+                # Save checkpoint if it's the best so far
+                if len(val_losses) == 0 or val_loss < min(val_losses):
+                    logger.info(f"New best validation loss: {val_loss:.3f}, saving checkpoint")
                     accelerator.save_state(output_dir)
                     # TODO: keep only the k best checkpoints
                 val_losses.append(val_loss)

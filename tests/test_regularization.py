@@ -2,19 +2,19 @@ import pytest
 import torch
 from torch.optim import Adam
 
-from llamlam.config import LMConfig, TrainConfig
+from llamlam.config import Config, Config
 from llamlam.model import GPTModel
 
 
 @pytest.fixture
 def model():
-    config = LMConfig(max_length=16, vocab_size=100, n_layer=2, n_head=2, head_width=8)
+    config = Config(max_seq_length=16, vocab_size=100, n_layers=2, n_heads=2, dim_head=8)
     return GPTModel(config)
 
 
 @pytest.fixture
 def train_config():
-    return TrainConfig()
+    return Config()
 
 
 def test_weight_decay(model, train_config):

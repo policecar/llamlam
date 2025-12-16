@@ -8,7 +8,7 @@ class DataCollator:
         if self.config.pad_to_multiple_of is not None:
             batch = self.tokenizer(
                 examples,
-                padding="True",
+                padding=True,
                 max_length=None,
                 pad_to_multiple_of=self.config.pad_to_multiple_of,
                 truncation=True,

@@ -7,13 +7,13 @@ import torch
 import torch.nn as nn
 from torch.autograd import gradcheck
 
-from llamlam.config import LMConfig
-from llamlam.model import GPTModel, Attention, Block
+from llamlam.config import Config
+from llamlam.model import GPTModel, Context, Block
 
 
 @pytest.fixture
 def small_config():
-    return LMConfig(max_length=16, vocab_size=100, n_layer=2, n_head=2, head_width=8)
+    return Config(max_seq_length=16, vocab_size=100, n_layers=2, n_heads=2, dim_head=8)
 
 
 @pytest.fixture
@@ -22,11 +22,11 @@ def model(small_config):
 
 
 def test_attention_gradient(small_config):
-    attention = Attention(small_config.n_embd, small_config.n_head)
+    attention = Context(small_config.dim_embd, small_config.n_heads)
     attention.double()  # Convert to double precision for numerical stability
 
     input = torch.randn(
-        2, 16, small_config.n_embd, dtype=torch.double, requires_grad=True
+        2, 16, small_config.dim_embd, dtype=torch.double, requires_grad=True
     )
 
     assert gradcheck(attention, (input,), eps=1e-6, atol=1e-4)
@@ -37,7 +37,7 @@ def test_block_gradient(small_config):
     block.double()
 
     input = torch.randn(
-        2, 16, small_config.n_embd, dtype=torch.double, requires_grad=True
+        2, 16, small_config.dim_embd, dtype=torch.double, requires_grad=True
     )
 
     assert gradcheck(block, (input,), eps=1e-6, atol=1e-4)
