@@ -133,7 +133,11 @@ class GPTModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.dim_embd)
         self.head = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
-        self.loss_fn = nn.CrossEntropyLoss()
+        # Use ignore_index for padding tokens if pad_token_id is set
+        if config.pad_token_id is not None:
+            self.loss_fn = nn.CrossEntropyLoss(ignore_index=config.pad_token_id)
+        else:
+            self.loss_fn = nn.CrossEntropyLoss()
         self.bias = config.bias
         self.dropout = config.dropout
 

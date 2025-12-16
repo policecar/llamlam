@@ -8,7 +8,14 @@ from llamlam.model import GPTModel
 
 @pytest.fixture
 def model():
-    config = Config(max_seq_length=16, vocab_size=100, n_layers=2, n_heads=2, dim_head=8)
+    config = Config(
+        max_seq_length=16,
+        vocab_size=100,
+        n_layers=2,
+        n_heads=2,
+        dim_head=8,
+        pad_token_id=99,  # vocab_size - 1
+    )
     return GPTModel(config)
 
 
@@ -77,9 +84,9 @@ def test_loss_with_padding(model):
     )
     manual_loss = (manual_loss * mask.view(-1)).sum() / mask.sum()
 
-    # Note: Model doesn't explicitly mask padding tokens, so there will be small differences
+    # Model now properly masks padding tokens via CrossEntropyLoss(ignore_index)
     assert torch.allclose(
-        loss_with_padding, manual_loss, rtol=1e-2, atol=1e-2
+        loss_with_padding, manual_loss, rtol=1e-4, atol=1e-5
     ), "Loss doesn't handle padding correctly"
 
 

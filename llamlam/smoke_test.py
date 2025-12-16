@@ -57,6 +57,7 @@ def run_smoke_test(verbose: bool = True):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     config.vocab_size = len(tokenizer)
+    config.pad_token_id = tokenizer.pad_token_id
 
     # Load SMALL subset of real data
     if verbose:

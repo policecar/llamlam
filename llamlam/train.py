@@ -107,11 +107,11 @@ if __name__ == "__main__":
     tokenizer.model_max_length = config.max_seq_length
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-        # model.config.pad_token_id = model.config.eos_token_id
     logger.info(f"Tokenizer initialized with vocabulary size: {len(tokenizer)}")
 
-    # Update model config with tokenizer vocabulary size
+    # Update model config with tokenizer vocabulary size and pad_token_id
     config.vocab_size = len(tokenizer)
+    config.pad_token_id = tokenizer.pad_token_id
 
     ##########################################
     # Init WandB, save config

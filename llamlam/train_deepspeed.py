@@ -167,6 +167,7 @@ def main(
 
     config = Config(
         vocab_size=len(tokenizer),
+        pad_token_id=tokenizer.pad_token_id,
         max_length=512,
         n_head=n_head,
         n_layer=n_layer,

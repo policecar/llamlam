@@ -26,6 +26,7 @@ class Config:
                                             # make sure to pad to multiples of 8/16
                                             # mixed_precision == "fp8" uses 16
                                             # mixed_precision != "no" uses 8
+    pad_token_id: Optional[int] = None      # padding token id for loss masking
 
     # Model config
     n_layers: int = 12                      # number of layers
