@@ -54,5 +54,56 @@ class Config:
 
     def __post_init__(self):
         self.dim_embd = self.n_heads * self.dim_head
+        self._validate()
+
+    def _validate(self):
+        """Validate configuration parameters to catch errors early."""
+        # Positive integer constraints
+        if self.n_heads <= 0:
+            raise ValueError(f"n_heads must be positive, got {self.n_heads}")
+        if self.dim_head <= 0:
+            raise ValueError(f"dim_head must be positive, got {self.dim_head}")
+        if self.n_layers <= 0:
+            raise ValueError(f"n_layers must be positive, got {self.n_layers}")
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.max_seq_length <= 0:
+            raise ValueError(f"max_seq_length must be positive, got {self.max_seq_length}")
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.gradient_accumulation_steps <= 0:
+            raise ValueError(f"gradient_accumulation_steps must be positive, got {self.gradient_accumulation_steps}")
+        if self.n_warmup_steps < 0:
+            raise ValueError(f"n_warmup_steps must be non-negative, got {self.n_warmup_steps}")
+        if self.n_epochs <= 0:
+            raise ValueError(f"n_epochs must be positive, got {self.n_epochs}")
+        if self.eval_steps <= 0:
+            raise ValueError(f"eval_steps must be positive, got {self.eval_steps}")
+        if self.n_data_workers < 0:
+            raise ValueError(f"n_data_workers must be non-negative, got {self.n_data_workers}")
+
+        # Range constraints for floats
+        if not 0.0 <= self.dropout <= 1.0:
+            raise ValueError(f"dropout must be in [0, 1], got {self.dropout}")
+        if self.learning_rate <= 0:
+            raise ValueError(f"learning_rate must be positive, got {self.learning_rate}")
+        if self.weight_decay < 0:
+            raise ValueError(f"weight_decay must be non-negative, got {self.weight_decay}")
+        if self.gradient_clipping < 0:
+            raise ValueError(f"gradient_clipping must be non-negative, got {self.gradient_clipping}")
+
+        # Logical constraints
+        if self.dim_embd % self.n_heads != 0:
+            raise ValueError(f"dim_embd ({self.dim_embd}) must be divisible by n_heads ({self.n_heads})")
+
+        # Scheduler type validation
+        valid_schedulers = ["linear", "cosine", "constant", "polynomial"]
+        if self.lr_scheduler_type not in valid_schedulers:
+            raise ValueError(f"lr_scheduler_type must be one of {valid_schedulers}, got '{self.lr_scheduler_type}'")
+
+        # Optional constraints
+        if self.pad_to_multiple_of is not None and self.pad_to_multiple_of <= 0:
+            raise ValueError(f"pad_to_multiple_of must be positive if specified, got {self.pad_to_multiple_of}")
+
 
 # fmt: on
