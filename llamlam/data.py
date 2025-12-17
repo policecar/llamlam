@@ -1,9 +1,12 @@
+from typing import List, Dict, Any
+
+
 class DataCollator:
-    def __init__(self, tokenizer, config):
+    def __init__(self, tokenizer: Any, config: Any) -> None:
         self.tokenizer = tokenizer
         self.config = config
 
-    def __call__(self, examples):
+    def __call__(self, examples: List[Dict[str, str]]) -> Dict[str, Any]:
         examples = [example["text"] for example in examples]
         if self.config.pad_to_multiple_of is not None:
             batch = self.tokenizer(

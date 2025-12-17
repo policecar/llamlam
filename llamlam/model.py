@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.init as init
 from torch.nn import functional as F
+from typing import Optional, Dict, Any, List
 
 from llamlam.activation import GELU
 from llamlam.utils import get_device
@@ -145,7 +146,12 @@ class GPTModel(nn.Module):
         init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         position_ids = torch.arange(
             0, input_ids.size(1), dtype=torch.long, device=input_ids.device
         )
@@ -192,7 +198,9 @@ class GPTModel(nn.Module):
         model.eval()
         return model
 
-    def generate(self, tokenizer, prompt, max_new_tokens=100):
+    def generate(
+        self, tokenizer: Any, prompt: str, max_new_tokens: int = 100
+    ) -> str:
         """
         Generate text from the model.
 

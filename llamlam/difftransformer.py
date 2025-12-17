@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from typing import Optional, Dict, Any
 
 from .activation import SwiGLU
 from .utils import get_device
@@ -286,7 +287,12 @@ class DiffTransformer(nn.Module):
         nn.init.xavier_uniform_(self.pos_emb.weight)
         nn.init.xavier_uniform_(self.head.weight)
 
-    def forward(self, x, attention_mask=None, output_hidden_states=False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        output_hidden_states: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for the DiffTransformer.
 
@@ -344,7 +350,9 @@ class DiffTransformer(nn.Module):
         model.eval()
         return model
 
-    def generate(self, tokenizer, prompt, max_new_tokens=100):
+    def generate(
+        self, tokenizer: Any, prompt: str, max_new_tokens: int = 100
+    ) -> str:
         """
         Generate text from the model.
 

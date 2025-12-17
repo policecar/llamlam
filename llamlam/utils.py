@@ -1,9 +1,12 @@
 import numpy as np
 import torch
 import random
+from typing import Optional, List, Dict, Any, Tuple
+from torch.utils.data import DataLoader
+from torch import nn
 
 
-def set_seed(seed: int = 137):
+def set_seed(seed: int = 137) -> None:
     """Set the seed for the random number generators."""
     random.seed(seed)
     np.random.seed(seed)
@@ -28,7 +31,12 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def evaluate(model, dataloader, device=None, accelerator=None):
+def evaluate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: Optional[torch.device] = None,
+    accelerator: Optional[Any] = None,
+) -> Tuple[float, float]:
     """
     Evaluate the model on the given dataloader.
 
@@ -69,7 +77,9 @@ def evaluate(model, dataloader, device=None, accelerator=None):
     return loss.item(), perplexity
 
 
-def get_grouped_params(model, weight_decay=0.1, no_decay=[]):
+def get_grouped_params(
+    model: nn.Module, weight_decay: float = 0.1, no_decay: List[str] = []
+) -> List[Dict[str, Any]]:
     """
     Get grouped parameters for the optimizer.
 
