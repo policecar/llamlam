@@ -47,7 +47,10 @@ def evaluate(model, dataloader, device=None, accelerator=None):
 
     model.eval()
     for step, batch in enumerate(dataloader):
-        input_ids = batch["input_ids"]  # .to(device)
+        input_ids = batch["input_ids"]
+        # Move to device if specified (for non-accelerator usage)
+        if device is not None:
+            input_ids = input_ids.to(device)
         with torch.no_grad():
             outputs = model(input_ids)
         loss = outputs["loss"]
