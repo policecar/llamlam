@@ -123,7 +123,7 @@ class GrokAdamW(Optimizer):
 
             # Function to apply parameter updates
             def _apply_updates():
-                self._update_group(group, params_with_grad, grads, grokking_signal)
+                self._update_group(group, params_with_grad, grads, grokking_signal, self.state)
 
             if use_amp:
                 with autocast():
@@ -161,31 +161,32 @@ class GrokAdamW(Optimizer):
         params: list[torch.Tensor],
         grads: list[torch.Tensor],
         grokking_signal: Optional[float],
+        state: dict,
     ) -> None:
+        # Apply global gradient clipping if enabled
+        if group["gradient_clipping"] > 0:
+            torch.nn.utils.clip_grad_norm_(params, group["gradient_clipping"])
+
         for i, (p, grad) in enumerate(zip(params, grads)):
-            state = group["state"][p]
-            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            param_state = state[p]
+            exp_avg, exp_avg_sq = param_state["exp_avg"], param_state["exp_avg_sq"]
             beta1, beta2 = group["betas"]
 
-            state["step"] += 1
-
-            # Apply gradient clipping if enabled
-            if group["gradient_clipping"] > 0:
-                torch.nn.utils.clip_grad_norm_(p, group["gradient_clipping"])
+            param_state["step"] += 1
 
             # Layer-wise momentum decay
             layer_beta1 = beta1 * (1 - group["gamma"]) ** i
 
             # Grokfast component
-            grok_grad = GrokAdamW._update_grok_ema(grad, state, group, grokking_signal)
+            grok_grad = GrokAdamW._update_grok_ema(grad, param_state, group, grokking_signal)
 
             # AdamW update with Grokfast-amplified gradient
             exp_avg.mul_(layer_beta1).add_(grok_grad, alpha=1 - layer_beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grok_grad, grok_grad, value=1 - beta2)
 
             # AdamW bias correction
-            bias_correction1 = 1 - beta1 ** state["step"]
-            bias_correction2 = 1 - beta2 ** state["step"]
+            bias_correction1 = 1 - beta1 ** param_state["step"]
+            bias_correction2 = 1 - beta2 ** param_state["step"]
             step_size = group["lr"] * torch.sqrt(bias_correction2) / bias_correction1
 
             # Decoupled weight decay (from AdamW)
@@ -321,7 +322,7 @@ class Muon(torch.optim.Optimizer):
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in params)
             updates_flat = torch.zeros(
-                total_params, device="cuda", dtype=torch.bfloat16
+                total_params, device=get_device(), dtype=torch.bfloat16
             )
             curr_idx = 0
             for i, p in enumerate(params):
