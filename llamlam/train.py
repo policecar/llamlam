@@ -212,7 +212,6 @@ if __name__ == "__main__":
     )
 
     val_losses = []
-    tokens_seen = 0
     global_step = 0
 
     # TODO: add resumption of training from a checkpoint
@@ -236,7 +235,6 @@ if __name__ == "__main__":
                 optimizer.zero_grad()  # reset gradients
 
             train_loss += loss.item()
-            tokens_seen += input_ids.numel()
             if global_step < 10:  # at the beginning, log some train losses
                 logger.info(f"Epoch {epoch}, step {step}, loss {loss.item()}")
 

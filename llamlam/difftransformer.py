@@ -382,8 +382,7 @@ class DiffTransformer(nn.Module):
                 idx_cond = token_ids[:, -self.config.max_seq_length :]
 
                 # Get the predictions
-                with torch.no_grad():
-                    logits = self(idx_cond)["logits"]
+                logits = self(idx_cond)["logits"]
 
                 # Focus only on the last time step
                 # (batch, n_token, vocab_size) becomes (batch, vocab_size)
