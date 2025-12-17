@@ -182,7 +182,7 @@ class GrokAdamW(Optimizer):
             # AdamW bias correction
             bias_correction1 = 1 - beta1 ** param_state["step"]
             bias_correction2 = 1 - beta2 ** param_state["step"]
-            step_size = group["lr"] * torch.sqrt(bias_correction2) / bias_correction1
+            step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1
 
             # Decoupled weight decay (from AdamW)
             p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -281,13 +281,13 @@ class Muon(torch.optim.Optimizer):
             adamw_wd=adamw_wd,
         )
 
-        params = list(muon_params)
-        adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
+        muon_params_list = list(muon_params)
+        adamw_params_list = list(adamw_params) if adamw_params is not None else []
+        params = muon_params_list + adamw_params_list
         super().__init__(params, defaults)
 
         # Sort parameters into those for which we will use Muon, and those for which we will not
-        for p in muon_params:
+        for p in muon_params_list:
             if p not in self.state:
                 self.state[p] = {}
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
@@ -295,7 +295,7 @@ class Muon(torch.optim.Optimizer):
                 self.state[p]["use_muon"] = True
             else:
                 self.state[p]["use_muon"] = False
-        for p in adamw_params:
+        for p in adamw_params_list:
             if p not in self.state:
                 self.state[p] = {}
             # Do not use Muon for parameters in adamw_params
