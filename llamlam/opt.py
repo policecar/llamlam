@@ -7,6 +7,7 @@ Up-and-coming optimizers:
 """
 
 import os
+import math
 import torch
 
 import torch.distributed as dist
@@ -63,26 +64,20 @@ class GrokAdamW(Optimizer):
         )
         super(GrokAdamW, self).__init__(params, defaults)
 
-        # Pre-allocate state tensors and move to best available device
-        device = get_device()
+        # Pre-allocate state tensors on same device as parameters
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p] = {}
                 state["step"] = 0
-                state["exp_avg"] = torch.empty_like(
+                state["exp_avg"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
-                ).to(device)
-                state["exp_avg_sq"] = torch.empty_like(
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
-                ).to(device)
-                state["grok_ema"] = torch.empty_like(
+                )
+                state["grok_ema"] = torch.zeros_like(
                     p, memory_format=torch.preserve_format
-                ).to(device)
-
-                # Initialize tensors
-                state["exp_avg"].zero_()
-                state["exp_avg_sq"].zero_()
-                state["grok_ema"].zero_()
+                )
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -202,7 +197,7 @@ class GrokAdamW(Optimizer):
         grok_ema = state["grok_ema"]
         alpha = group["alpha_init"]
         if grokking_signal is not None:
-            alpha = alpha * torch.exp(
+            alpha = alpha * math.exp(
                 -group["grokking_signal_decay_rate"] * grokking_signal
             )
         grok_ema.mul_(alpha).add_(grad, alpha=1 - alpha)
@@ -293,12 +288,16 @@ class Muon(torch.optim.Optimizer):
 
         # Sort parameters into those for which we will use Muon, and those for which we will not
         for p in muon_params:
+            if p not in self.state:
+                self.state[p] = {}
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
             if p.ndim >= 2 and p.size(0) < 10000:
                 self.state[p]["use_muon"] = True
             else:
                 self.state[p]["use_muon"] = False
         for p in adamw_params:
+            if p not in self.state:
+                self.state[p] = {}
             # Do not use Muon for parameters in adamw_params
             self.state[p]["use_muon"] = False
 
