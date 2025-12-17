@@ -51,10 +51,14 @@ def test_loss_nonnegativity(model):
 
 def test_loss_reduction(model_no_padding):
     input_ids = torch.randint(0, 100, (4, 16))
-    loss = model_no_padding(input_ids)["loss"]
 
-    # Calculate loss manually
-    logits = model_no_padding(input_ids)["logits"]
+    # Get both loss and logits from a single forward pass
+    # (calling model twice would give different results due to dropout)
+    outputs = model_no_padding(input_ids)
+    loss = outputs["loss"]
+    logits = outputs["logits"]
+
+    # Calculate loss manually from the same logits
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
     manual_loss = F.cross_entropy(
