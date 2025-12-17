@@ -19,7 +19,7 @@ from transformers import AutoTokenizer
 from llamlam.config import Config
 from llamlam.data import DataCollator
 from llamlam.difftransformer import DiffTransformer
-from llamlam.utils import evaluate, set_seed
+from llamlam.utils import evaluate, get_device, set_seed
 
 
 def run_smoke_test(verbose: bool = True):
@@ -97,7 +97,7 @@ def run_smoke_test(verbose: bool = True):
     if verbose:
         print("Creating model...")
     model = DiffTransformer(config)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     model.to(device)
 
     param_count = sum(p.numel() for p in model.parameters())

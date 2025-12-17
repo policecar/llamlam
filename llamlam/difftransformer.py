@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import math
 
 from .activation import SwiGLU
+from .utils import get_device
 
 
 class RMSNorm(nn.Module):
@@ -355,13 +356,7 @@ class DiffTransformer(nn.Module):
         Returns:
             Decoded text
         """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
         self.eval()
         self.to(device)
@@ -417,8 +412,8 @@ if __name__ == "__main__":
     # Instantiate the model
     model = DiffTransformer(config)
 
-    # Move model to device (GPU if available)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Move model to device (best available)
+    device = get_device()
     model.to(device)
 
     # Example input: batch of token indices

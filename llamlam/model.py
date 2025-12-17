@@ -5,6 +5,7 @@ import torch.nn.init as init
 from torch.nn import functional as F
 
 from llamlam.activation import GELU
+from llamlam.utils import get_device
 
 
 class LayerNorm(nn.Module):
@@ -203,13 +204,7 @@ class GPTModel(nn.Module):
         Returns:
             Decoded text
         """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        device = get_device()
 
         self.eval()
         self.to(device)

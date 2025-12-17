@@ -10,6 +10,7 @@ import os
 import torch
 
 import torch.distributed as dist
+from llamlam.utils import get_device
 
 from torch.optim.optimizer import Optimizer
 from torch.cuda.amp import autocast
@@ -62,8 +63,8 @@ class GrokAdamW(Optimizer):
         )
         super(GrokAdamW, self).__init__(params, defaults)
 
-        # Pre-allocate state tensors and move to CUDA if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Pre-allocate state tensors and move to best available device
+        device = get_device()
         for group in self.param_groups:
             for p in group["params"]:
                 state = self.state[p] = {}

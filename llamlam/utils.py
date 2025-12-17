@@ -11,6 +11,23 @@ def set_seed(seed: int = 137):
     torch.cuda.manual_seed_all(seed)
 
 
+def get_device() -> torch.device:
+    """Get the best available device (CUDA > MPS > CPU).
+
+    Returns:
+        torch.device: The best available device for computation.
+
+    Note:
+        For training code, use Accelerator instead of this function.
+        This is intended for inference, testing, and simple scripts.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
 def evaluate(model, dataloader, device=None, accelerator=None):
     """
     Evaluate the model on the given dataloader.
