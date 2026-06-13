@@ -7,6 +7,25 @@ from torch.nn import functional as F
 from llamlam.activation import GELU
 
 
+def _build_additive_mask(attention_mask, input_ids, dtype):
+    """Combine the causal mask with an optional key-padding mask.
+
+    Returns an additive bias of shape (batch, 1, L, L) with 0.0 where attention
+    is allowed and -inf where it is masked, or None when no padding mask is given
+    (so SDPA can use its fused causal path).
+    """
+    if attention_mask is None:
+        return None
+    batch, L = input_ids.shape
+    device = input_ids.device
+    causal = torch.ones(L, L, dtype=torch.bool, device=device).tril()
+    key_pad = attention_mask.bool().view(batch, 1, 1, L)
+    keep = causal.view(1, 1, L, L) & key_pad  # (batch, 1, L, L)
+    bias = torch.zeros(batch, 1, L, L, dtype=dtype, device=device)
+    bias.masked_fill_(~keep, float("-inf"))
+    return bias
+
+
 class LayerNorm(nn.Module):
     """
     LayerNorm as described in https://arxiv.org/abs/1607.06450
@@ -35,7 +54,7 @@ class LayerNorm(nn.Module):
 
 
 class Context(nn.Module):
-    def __init__(self, dim_embd, n_heads, alpha=0.5):
+    def __init__(self, dim_embd, n_heads):
         super().__init__()
 
         self.dim_embd = dim_embd
@@ -45,25 +64,17 @@ class Context(nn.Module):
             self.dim_head * n_heads == dim_embd
         ), "dim_head should be dim_embd // n_heads because efficiency"
 
-        # Scale factor for dot product attention
+        # Scale factor for dot-product attention: 1 / sqrt(d_k).
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
         # "We suspect that for large values of d_k, the dot products grow large in magnitude,
         #  pushing the softmax function into regions where it has extremely small gradients.
         #  To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
-        self.scaling = self.dim_head**-0.5  # not used
-
+        # We let scaled_dot_product_attention apply the default 1/sqrt(dim_head).
         self.qkv_proj = nn.Linear(dim_embd, 3 * dim_embd, bias=False)
         self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
+        # Weights are initialized centrally in GPTModel._init_weights.
 
-        # Initialization for linear layers
-        for name, param in self.qkv_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
-        for name, param in self.out_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
-
-    def forward(self, x, mask=None):
+    def forward(self, x, attn_mask=None):
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
@@ -74,9 +85,12 @@ class Context(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
 
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
-        )
+        if attn_mask is None:
+            # Fast path: let SDPA build the causal mask (and pick a fused kernel).
+            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # attn_mask already encodes causality + key padding as an additive bias.
+            attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, seq_length, self.dim_embd
         )
@@ -95,11 +109,7 @@ class Block(nn.Module):
             GELU(),
             nn.Linear(4 * config.dim_embd, config.dim_embd),
         )
-        for name, param in self.feedforward.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=0.5 * (1 / config.dim_embd) ** 0.5)
-            else:
-                init.zeros_(param)
+        # Weights are initialized centrally in GPTModel._init_weights.
 
         # Alternative implementation using Conv1D
         # self.feedforward = nn.Sequential(
@@ -112,8 +122,8 @@ class Block(nn.Module):
         self.norm_1 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
         self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
-    def forward(self, x):
-        attn = self.context(self.norm_1(x))
+    def forward(self, x, attn_mask=None):
+        attn = self.context(self.norm_1(x), attn_mask=attn_mask)
         attn = self.dropout(attn)
         x = x + attn
         mlp = self.feedforward(self.norm_2(x))
@@ -123,7 +133,7 @@ class Block(nn.Module):
 
 
 class GPTModel(nn.Module):
-    def __init__(self, config, alpha=0.5):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.dim_embd)
@@ -133,18 +143,41 @@ class GPTModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.dim_embd)
         self.head = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         self.bias = config.bias
         self.dropout = config.dropout
 
-        init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
-        init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
+        # GPT-2 style init: normal(0, init_std), then scale residual projections
+        # by 1/sqrt(2 * n_layers) so the residual stream stays unit-scale at depth.
+        self.apply(self._init_weights)
+        for name, param in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith("feedforward.2.weight"):
+                init.normal_(
+                    param,
+                    mean=0.0,
+                    std=config.init_std / (2 * config.n_layers) ** 0.5,
+                )
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(
-            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
-        )
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        # Optionally tie the input embedding and the output projection.
+        if config.tie_word_embeddings:
+            self.head.weight = self.embed.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        labels=None,
+        output_hidden_states=False,
+    ):
+        attn_mask = _build_additive_mask(attention_mask, input_ids, self.embed.weight.dtype)
 
         hidden_states = []
         x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]
@@ -152,7 +185,7 @@ class GPTModel(nn.Module):
             hidden_states.append(x)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x, attn_mask=attn_mask)
             if output_hidden_states:
                 hidden_states.append(x)
 
@@ -160,14 +193,16 @@ class GPTModel(nn.Module):
         logits = self.head(x).float()
         outputs = {"logits": logits}
 
-        if input_ids is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            outputs["loss"] = loss
+        # Default to next-token labels derived from the inputs; padding should be
+        # supplied via `labels` with -100 (see DataCollator) to be ignored.
+        if labels is None:
+            labels = input_ids
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = self.loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states

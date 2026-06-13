@@ -14,6 +14,23 @@ import math
 from .activation import SwiGLU
 
 
+def build_causal_additive_mask(N, dtype, device, attention_mask=None):
+    """Additive attention bias of shape (1 or batch, 1, N, N).
+
+    0.0 where attention is allowed, -inf otherwise. Always causal; if
+    ``attention_mask`` (batch, N) is given, padded keys are masked too.
+    """
+    bias = torch.zeros(N, N, dtype=dtype, device=device)
+    bias.masked_fill_(
+        torch.ones(N, N, dtype=torch.bool, device=device).triu(1), float("-inf")
+    )
+    bias = bias.view(1, 1, N, N)
+    if attention_mask is not None:
+        key_pad = attention_mask.bool().view(-1, 1, 1, N)
+        bias = bias.masked_fill(~key_pad, float("-inf"))
+    return bias
+
+
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization.
@@ -96,12 +113,15 @@ class MultiHeadDifferentialAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_o.weight)
         nn.init.constant_(self.rms_scale, 1.0)
 
-    def forward(self, X):
+    def forward(self, X, attn_mask=None):
         """
         Forward pass for Multi-Head Differential Attention.
 
         Args:
             X (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
+            attn_mask (Tensor): Additive attention bias broadcastable to
+                (batch, n_heads, N, N), encoding causality and any key padding.
+                Built once per forward by the parent model.
 
         Returns:
             Tensor: Output tensor after applying differential attention.
@@ -141,24 +161,19 @@ class MultiHeadDifferentialAttention(nn.Module):
         # Shape: (batch, n_heads, 1, 1)
         lambda_val = lambda_val.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
-        # ------------------- Causal Mask Implementation ------------------- #
-        # Create a causal mask to prevent attention to future tokens
-        # Shape of mask: (1, 1, N, N)
-        mask = (
-            torch.tril(torch.ones((N, N), device=X.device)).unsqueeze(0).unsqueeze(0)
-        )  # (1, 1, N, N)
-        # Replace 1s with 0.0 and 0s with -inf
-        mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
-        # -------------------------------------------------------------------- #
+        # The additive causal (+ padding) mask is built once by the parent model
+        # and passed in; fall back to a plain causal mask for standalone use.
+        if attn_mask is None:
+            attn_mask = build_causal_additive_mask(N, X.dtype, X.device)
 
         # Compute attention scores
         scaling = 1 / math.sqrt(self.dim_head)
         A1 = torch.matmul(Q1, K1.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
         A2 = torch.matmul(Q2, K2.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
 
-        # Apply the causal mask
-        A1 = A1 + mask  # Mask out future positions
-        A2 = A2 + mask  # Mask out future positions
+        # Apply the causal (+ padding) mask
+        A1 = A1 + attn_mask  # Mask out future / padding positions
+        A2 = A2 + attn_mask  # Mask out future / padding positions
 
         # Apply softmax to get attention weights
         attention1 = F.softmax(A1, dim=-1)  # (batch, n_heads, N, N)
@@ -221,18 +236,19 @@ class DiffTransformerLayer(nn.Module):
         self.norm2 = RMSNorm(dim_embd)
         self.ff = SwiGLU(dim_embd)
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         """
         Forward pass for a single transformer layer.
 
         Args:
             x (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
+            attn_mask (Tensor): Additive attention bias passed to the attention.
 
         Returns:
             Tensor: Output tensor after processing through the layer.
         """
         # Apply Multi-Head Differential Attention with residual connection
-        y = self.attn(self.norm1(x)) + x
+        y = self.attn(self.norm1(x), attn_mask=attn_mask) + x
         # Apply SwiGLU Feed-Forward Network with residual connection
         z = self.ff(self.norm2(y)) + y
         return z
@@ -252,7 +268,7 @@ class DiffTransformer(nn.Module):
         super().__init__()
 
         self.config = config
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
         assert (
             self.config.dim_embd % self.config.n_heads == 0
@@ -285,15 +301,18 @@ class DiffTransformer(nn.Module):
         nn.init.xavier_uniform_(self.pos_emb.weight)
         nn.init.xavier_uniform_(self.head.weight)
 
-    def forward(self, x, attention_mask=None, output_hidden_states=False):
+    def forward(self, x, attention_mask=None, labels=None, output_hidden_states=False):
         """
         Forward pass for the DiffTransformer.
 
         Args:
-            x (Tensor): Input tensor of token indices of shape (batch, sequence_length).
+            x (Tensor): Input token indices of shape (batch, sequence_length).
+            attention_mask (Tensor): Optional (batch, N) padding mask.
+            labels (Tensor): Optional (batch, N) targets; positions set to -100
+                are ignored by the loss. Defaults to the inputs themselves.
 
         Returns:
-            Tensor: Logits for each token in the vocabulary of shape (batch, sequence_length, vocab_size).
+            dict with "logits" and "loss" (and "hidden_states" if requested).
         """
         batch, N = x.shape
         positions = (
@@ -301,10 +320,15 @@ class DiffTransformer(nn.Module):
         )  # (batch, N)
         hidden = self.token_emb(x) + self.pos_emb(positions)  # (batch, N, dim_embd)
 
+        # Build the additive causal (+ padding) mask once, reuse across layers.
+        attn_mask = build_causal_additive_mask(
+            N, hidden.dtype, x.device, attention_mask=attention_mask
+        )
+
         hidden_states = [hidden] if output_hidden_states else []
 
         for layer in self.layers:
-            hidden = layer(hidden)
+            hidden = layer(hidden, attn_mask=attn_mask)
             if output_hidden_states:
                 hidden_states.append(hidden)
 
@@ -313,17 +337,16 @@ class DiffTransformer(nn.Module):
 
         outputs = {"logits": logits}
 
-        # Calculate loss if input tokens provided
-        if x is not None:
-            # Shift logits and labels for next-token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = x[..., 1:].contiguous()
-
-            # Calculate cross entropy loss
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            outputs["loss"] = loss
+        # Shift logits and labels for next-token prediction. Padding should be
+        # supplied via `labels` with -100 (see DataCollator) to be ignored.
+        if labels is None:
+            labels = x
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss = self.loss_fn(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states

@@ -36,6 +36,8 @@ class Config:
                                             # GPT-2 used True; here we default to False which is slightly faster, better
     dropout: float = 0.1                    # dropout rate
     # qkv_bias: bool = True                 # use bias in qkv projection
+    init_std: float = 0.02                  # std for weight init (GPT-2 style)
+    tie_word_embeddings: bool = True        # share weights between input embed and output head
 
     # Training config
     n_epochs: int = 3
