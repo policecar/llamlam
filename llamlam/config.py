@@ -28,6 +28,9 @@ class Config:
                                             # mixed_precision != "no" uses 8
 
     # Model config
+    model_type: str = "diff"                # "diff" (DiffTransformer) or "gpt" (GPTModel)
+    optimizer: str = "adamw"                # "adamw", "muon" or "grokadamw"
+    mixed_precision: str = "no"             # "no", "fp16" or "bf16" (passed to Accelerator)
     n_layers: int = 12                      # number of layers
     n_heads: int = 12                       # number of heads
     dim_head: int = 64                      # dimensionality of each attention head

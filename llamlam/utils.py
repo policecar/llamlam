@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import random
 
+from torch.optim.adamw import AdamW
+
 
 def set_seed(seed: int = 137):
     """Set the seed for the random number generators."""
@@ -9,6 +11,56 @@ def set_seed(seed: int = 137):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def build_optimizer(model, config):
+    """Construct the optimizer named by ``config.optimizer``.
+
+    AdamW uses parameter groups (no weight decay on biases / norms). Muon splits
+    2D weight matrices (orthogonalized updates) from everything else (its internal
+    AdamW). GrokAdamW takes the same decay grouping as AdamW.
+    """
+    name = config.optimizer.lower()
+    if name == "adamw":
+        return AdamW(
+            get_grouped_params(
+                model, weight_decay=config.weight_decay, no_decay=config.no_decay
+            ),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+        )
+    if name == "grokadamw":
+        from llamlam.opt import GrokAdamW
+
+        return GrokAdamW(
+            get_grouped_params(
+                model, weight_decay=config.weight_decay, no_decay=config.no_decay
+            ),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            gradient_clipping=config.gradient_clipping,
+        )
+    if name == "muon":
+        from llamlam.opt import Muon
+
+        # Muon handles >=2D weight matrices; biases, norms, embeddings and the
+        # (tied) head go to the internal AdamW.
+        muon_params, adamw_params = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim >= 2 and "emb" not in n and "head" not in n:
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+        return Muon(
+            muon_params,
+            lr=config.learning_rate,
+            adamw_params=adamw_params,
+            adamw_lr=config.learning_rate,
+            adamw_wd=config.weight_decay,
+        )
+    raise ValueError(f"Unknown optimizer: {config.optimizer}")
 
 
 def evaluate(model, dataloader, device=None, accelerator=None):
@@ -30,9 +82,12 @@ def evaluate(model, dataloader, device=None, accelerator=None):
 
     model.eval()
     for step, batch in enumerate(dataloader):
-        input_ids = batch["input_ids"]  # .to(device)
         with torch.no_grad():
-            outputs = model(input_ids)
+            outputs = model(
+                batch["input_ids"],
+                attention_mask=batch.get("attention_mask"),
+                labels=batch.get("labels"),
+            )
         loss = outputs["loss"]
         if accelerator is not None:
             losses.append(accelerator.gather(loss.unsqueeze(0)))

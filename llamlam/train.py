@@ -11,7 +11,6 @@ import wandb
 
 from accelerate import Accelerator
 from datasets import load_dataset
-from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 
@@ -19,7 +18,8 @@ from llamlam.config import Config
 from llamlam.data import DataCollator
 
 from llamlam.difftransformer import DiffTransformer
-from llamlam.utils import evaluate, get_grouped_params, set_seed
+from llamlam.model import GPTModel
+from llamlam.utils import build_optimizer, evaluate, set_seed
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -46,8 +46,8 @@ if __name__ == "__main__":
         "--output_dir", type=str, default="experiments", help="Output directory"
     )
     parser.add_argument("--run_name", type=str, help="Run name")
-    parser.add_argument("--n_layer", type=int, help="Number of layers")
-    parser.add_argument("--n_head", type=int, help="Number of heads")
+    parser.add_argument("--n_layers", type=int, help="Number of layers")
+    parser.add_argument("--n_heads", type=int, help="Number of heads")
     parser.add_argument(
         "--dim_head",
         type=int,
@@ -68,6 +68,21 @@ if __name__ == "__main__":
         help="Type of learning rate scheduler",
     )
     parser.add_argument("--n_warmup_steps", type=int, help="Number of warmup steps")
+    parser.add_argument(
+        "--model_type", type=str, choices=["diff", "gpt"], help="Model architecture"
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["adamw", "muon", "grokadamw"],
+        help="Optimizer",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        choices=["no", "fp16", "bf16"],
+        help="Mixed-precision mode passed to Accelerator",
+    )
     args = parser.parse_args()
 
     # Load default config
@@ -90,14 +105,11 @@ if __name__ == "__main__":
     set_seed(seed=config.seed)
     logger.info(f"Using seed: {config.seed}")
 
-    accelerator = Accelerator()
+    accelerator = Accelerator(
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+    )
     device = accelerator.device
-
-    # device = torch.device(
-    #     "cuda"
-    #     if torch.cuda.is_available()
-    #     else "mps" if torch.backends.mps.is_available() else "cpu"
-    # )
 
     ##########################################
     # Initialize tokenizer & some
@@ -176,21 +188,13 @@ if __name__ == "__main__":
     # Instantiate model
     ##########################################
 
-    model = DiffTransformer(config)
-    # model = GPTModel(config)
-    # model.to(device)
+    model = GPTModel(config) if config.model_type == "gpt" else DiffTransformer(config)
 
     ##########################################
     # Define optimizer
     ##########################################
 
-    optimizer = AdamW(
-        get_grouped_params(
-            model, weight_decay=config.weight_decay, no_decay=config.no_decay
-        ),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(model, config)
 
     lr_scheduler = get_scheduler(
         name=config.lr_scheduler_type,
@@ -211,58 +215,67 @@ if __name__ == "__main__":
         model, optimizer, train_loader, val_loader, lr_scheduler
     )
 
-    val_losses = []
     tokens_seen = 0
     global_step = 0
+    best_val_loss = float("inf")
 
     # TODO: add resumption of training from a checkpoint
     # https://github.com/huggingface/accelerate/blob/main/examples/complete_nlp_example.py#L175
 
     for epoch in range(config.n_epochs):
         train_loss = 0.0
-        optimizer.zero_grad()  # reset gradients
-        for step, batch in enumerate(train_loader):
+        for batch in train_loader:
             model.train()
-            input_ids = batch["input_ids"]  # .to(device)
-            # attention_mask = batch["attention_mask"]  # .to(device)
-            loss = model(input_ids)["loss"]  # logits, (loss), (hidden_states)
-            loss = loss / config.gradient_accumulation_steps
-            accelerator.backward(loss)  # calculate loss gradients, loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-            if step % config.gradient_accumulation_steps == 0:
-                optimizer.step()  # update model parameters
-                lr_scheduler.step()  # update learning rate
-                optimizer.zero_grad()  # reset gradients
+            # accelerator.accumulate handles gradient accumulation (and DDP
+            # gradient-sync skipping) correctly, including the step boundary.
+            with accelerator.accumulate(model):
+                outputs = model(
+                    batch["input_ids"],
+                    attention_mask=batch.get("attention_mask"),
+                    labels=batch.get("labels"),
+                )
+                loss = outputs["loss"]
+                accelerator.backward(loss)
+                if accelerator.sync_gradients and config.gradient_clipping > 0:
+                    accelerator.clip_grad_norm_(
+                        model.parameters(), config.gradient_clipping
+                    )
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
             train_loss += loss.item()
-            tokens_seen += input_ids.numel()
-            if global_step < 10:  # at the beginning, log some train losses
-                logger.info(f"Epoch {epoch}, step {step}, loss {loss.item()}")
+            tokens_seen += batch["input_ids"].numel()
 
-            if global_step % config.eval_steps == 0:
-                val_loss, perplexity = evaluate(
-                    model, val_loader, accelerator=accelerator
+            # An optimizer update happened this iteration: advance global_step,
+            # log, evaluate and checkpoint on optimizer-step granularity.
+            if accelerator.sync_gradients:
+                global_step += 1
+
+                if global_step <= 10:
+                    logger.info(f"Epoch {epoch}, step {global_step}, loss {loss.item()}")
+
+                if global_step % config.eval_steps == 0:
+                    val_loss, perplexity = evaluate(
+                        model, val_loader, accelerator=accelerator
+                    )
+                    logger.info(
+                        f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
+                    )
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        accelerator.save_state(output_dir)
+                        # TODO: keep only the k best checkpoints
+
+                wandb.log(
+                    {
+                        "train_loss": loss.item(),
+                        "learning_rate": lr_scheduler.get_last_lr()[0],
+                        "tokens_seen": tokens_seen,
+                        "epoch": epoch,
+                    },
+                    step=global_step,
                 )
-                logger.info(
-                    f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
-                )
-                if (global_step == 0) or (val_loss < min(val_losses)):
-                    best_val_loss = min(val_losses) if len(val_losses) else val_loss
-                    accelerator.save_state(output_dir)
-                    # TODO: keep only the k best checkpoints
-                val_losses.append(val_loss)
-
-            global_step += 1
-
-            wandb.log(
-                {
-                    "train_loss": loss.item(),
-                    "learning_rate": lr_scheduler.get_last_lr()[0],
-                    "epoch": epoch,
-                },
-                step=global_step,
-            )
 
         avg_train_loss = train_loss / len(train_loader)
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
