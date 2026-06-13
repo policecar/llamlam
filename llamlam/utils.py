@@ -198,10 +198,17 @@ def generate(
 
     token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
     max_len = model.config.max_seq_length
+    past = None
 
     for _ in range(max_new_tokens):
-        idx_cond = token_ids[:, -max_len:]  # crop to context window
-        logits = model(idx_cond)["logits"][:, -1, :]  # last-step logits
+        if past is None:
+            # (Re)prefill the cropped context window.
+            out = model(token_ids[:, -max_len:], use_cache=True)
+        else:
+            # Incremental step: feed only the new token, reuse the cache.
+            out = model(token_ids[:, -1:], past_key_values=past, use_cache=True)
+        logits = out["logits"][:, -1, :]  # last-step logits
+        past = out["past_key_values"]
 
         if not do_sample:
             idx_next = torch.argmax(logits, dim=-1, keepdim=True)
@@ -212,6 +219,11 @@ def generate(
             idx_next = torch.multinomial(probs, num_samples=1)
 
         token_ids = torch.cat((token_ids, idx_next), dim=1)
+
+        # Learned positional embeddings only span max_len; once we reach it, drop
+        # the cache so the next step re-prefills the cropped window.
+        if token_ids.size(1) >= max_len:
+            past = None
 
     return tokenizer.decode(token_ids[0], skip_special_tokens=True)
 

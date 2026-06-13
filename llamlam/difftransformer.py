@@ -14,19 +14,23 @@ import math
 from .activation import SwiGLU
 
 
-def build_causal_additive_mask(N, dtype, device, attention_mask=None):
-    """Additive attention bias of shape (1 or batch, 1, N, N).
+def build_causal_additive_mask(q_len, k_len, dtype, device, attention_mask=None):
+    """Additive attention bias of shape (1 or batch, 1, q_len, k_len).
 
-    0.0 where attention is allowed, -inf otherwise. Always causal; if
-    ``attention_mask`` (batch, N) is given, padded keys are masked too.
+    0.0 where attention is allowed, -inf otherwise. Query row i has absolute
+    position (k_len - q_len + i) and may attend to keys 0..that position (so it
+    reduces to a square causal mask when q_len == k_len, and supports cached
+    decoding when q_len < k_len). If ``attention_mask`` (batch, k_len) is given,
+    padded keys are masked too.
     """
-    bias = torch.zeros(N, N, dtype=dtype, device=device)
-    bias.masked_fill_(
-        torch.ones(N, N, dtype=torch.bool, device=device).triu(1), float("-inf")
-    )
-    bias = bias.view(1, 1, N, N)
+    past = k_len - q_len
+    i = torch.arange(q_len, device=device).view(q_len, 1)
+    j = torch.arange(k_len, device=device).view(1, k_len)
+    bias = torch.zeros(q_len, k_len, dtype=dtype, device=device)
+    bias.masked_fill_(j > past + i, float("-inf"))
+    bias = bias.view(1, 1, q_len, k_len)
     if attention_mask is not None:
-        key_pad = attention_mask.bool().view(-1, 1, 1, N)
+        key_pad = attention_mask.bool().view(-1, 1, 1, k_len)
         bias = bias.masked_fill(~key_pad, float("-inf"))
     return bias
 
@@ -113,18 +117,20 @@ class MultiHeadDifferentialAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_o.weight)
         nn.init.constant_(self.rms_scale, 1.0)
 
-    def forward(self, X, attn_mask=None):
+    def forward(self, X, attn_mask=None, past_kv=None, use_cache=False):
         """
         Forward pass for Multi-Head Differential Attention.
 
         Args:
             X (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
             attn_mask (Tensor): Additive attention bias broadcastable to
-                (batch, n_heads, N, N), encoding causality and any key padding.
-                Built once per forward by the parent model.
+                (batch, n_heads, q_len, k_len), encoding causality and any key
+                padding. Built once per forward by the parent model.
+            past_kv (tuple): Cached (K, V) from previous steps, or None.
+            use_cache (bool): If True, return the updated (K, V) as ``present``.
 
         Returns:
-            Tensor: Output tensor after applying differential attention.
+            (Tensor, tuple|None): the attention output and the (K, V) cache.
         """
         batch, N, dim_embd = X.shape
 
@@ -139,9 +145,16 @@ class MultiHeadDifferentialAttention(nn.Module):
         K = K.view(batch, N, self.n_heads, 2 * self.dim_head).transpose(1, 2)
         V = V.view(batch, N, self.n_heads, 2 * self.dim_head).transpose(1, 2)
 
+        # Prepend cached keys/values for incremental decoding.
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            K = torch.cat([past_k, K], dim=2)  # (batch, n_heads, T, 2 * d_head)
+            V = torch.cat([past_v, V], dim=2)
+        present = (K, V) if use_cache else None
+
         # Split Q and K into Q1, Q2 and K1, K2
-        Q1, Q2 = Q.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
-        K1, K2 = K.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
+        Q1, Q2 = Q.chunk(2, dim=-1)  # (batch, n_heads, N, d_head)
+        K1, K2 = K.chunk(2, dim=-1)  # (batch, n_heads, T, d_head)
 
         # Compute lambda using reparameterization
         # lambda_val = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
@@ -164,12 +177,12 @@ class MultiHeadDifferentialAttention(nn.Module):
         # The additive causal (+ padding) mask is built once by the parent model
         # and passed in; fall back to a plain causal mask for standalone use.
         if attn_mask is None:
-            attn_mask = build_causal_additive_mask(N, X.dtype, X.device)
+            attn_mask = build_causal_additive_mask(N, K.size(2), X.dtype, X.device)
 
         # Compute attention scores
         scaling = 1 / math.sqrt(self.dim_head)
-        A1 = torch.matmul(Q1, K1.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
-        A2 = torch.matmul(Q2, K2.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
+        A1 = torch.matmul(Q1, K1.transpose(-2, -1)) * scaling  # (batch, n_heads, N, T)
+        A2 = torch.matmul(Q2, K2.transpose(-2, -1)) * scaling  # (batch, n_heads, N, T)
 
         # Apply the causal (+ padding) mask
         A1 = A1 + attn_mask  # Mask out future / padding positions
@@ -214,7 +227,7 @@ class MultiHeadDifferentialAttention(nn.Module):
         # Final linear projection
         out = self.W_o(O_concat)  # (batch, N, dim_embd)
 
-        return out
+        return out, present
 
 
 class DiffTransformerLayer(nn.Module):
@@ -236,22 +249,27 @@ class DiffTransformerLayer(nn.Module):
         self.norm2 = RMSNorm(dim_embd)
         self.ff = SwiGLU(dim_embd)
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
         """
         Forward pass for a single transformer layer.
 
         Args:
             x (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
             attn_mask (Tensor): Additive attention bias passed to the attention.
+            past_kv (tuple): Cached (K, V) for incremental decoding, or None.
+            use_cache (bool): If True, return the updated (K, V) cache.
 
         Returns:
-            Tensor: Output tensor after processing through the layer.
+            (Tensor, tuple|None): layer output and the (K, V) cache.
         """
         # Apply Multi-Head Differential Attention with residual connection
-        y = self.attn(self.norm1(x), attn_mask=attn_mask) + x
+        attn_out, present = self.attn(
+            self.norm1(x), attn_mask=attn_mask, past_kv=past_kv, use_cache=use_cache
+        )
+        y = attn_out + x
         # Apply SwiGLU Feed-Forward Network with residual connection
         z = self.ff(self.norm2(y)) + y
-        return z
+        return z, present
 
 
 class DiffTransformer(nn.Module):
@@ -301,7 +319,15 @@ class DiffTransformer(nn.Module):
         nn.init.xavier_uniform_(self.pos_emb.weight)
         nn.init.xavier_uniform_(self.head.weight)
 
-    def forward(self, x, attention_mask=None, labels=None, output_hidden_states=False):
+    def forward(
+        self,
+        x,
+        attention_mask=None,
+        labels=None,
+        output_hidden_states=False,
+        past_key_values=None,
+        use_cache=False,
+    ):
         """
         Forward pass for the DiffTransformer.
 
@@ -310,25 +336,40 @@ class DiffTransformer(nn.Module):
             attention_mask (Tensor): Optional (batch, N) padding mask.
             labels (Tensor): Optional (batch, N) targets; positions set to -100
                 are ignored by the loss. Defaults to the inputs themselves.
+            past_key_values (list): Per-layer cached (K, V) for decoding, or None.
+            use_cache (bool): If True, return per-layer (K, V) in "past_key_values".
 
         Returns:
-            dict with "logits" and "loss" (and "hidden_states" if requested).
+            dict with "logits" and "loss" (and "hidden_states"/"past_key_values").
         """
         batch, N = x.shape
+        past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
         positions = (
-            torch.arange(N, device=x.device).unsqueeze(0).expand(batch, N)
+            torch.arange(past_len, past_len + N, device=x.device)
+            .unsqueeze(0)
+            .expand(batch, N)
         )  # (batch, N)
         hidden = self.token_emb(x) + self.pos_emb(positions)  # (batch, N, dim_embd)
 
         # Build the additive causal (+ padding) mask once, reuse across layers.
+        # Keys span the cached prefix (past_len + N); queries are the new tokens.
         attn_mask = build_causal_additive_mask(
-            N, hidden.dtype, x.device, attention_mask=attention_mask
+            N,
+            past_len + N,
+            hidden.dtype,
+            x.device,
+            attention_mask=attention_mask if past_len == 0 else None,
         )
 
         hidden_states = [hidden] if output_hidden_states else []
 
-        for layer in self.layers:
-            hidden = layer(hidden, attn_mask=attn_mask)
+        presents = []
+        for i, layer in enumerate(self.layers):
+            past = past_key_values[i] if past_key_values is not None else None
+            hidden, present = layer(
+                hidden, attn_mask=attn_mask, past_kv=past, use_cache=use_cache
+            )
+            presents.append(present)
             if output_hidden_states:
                 hidden_states.append(hidden)
 
@@ -336,17 +377,21 @@ class DiffTransformer(nn.Module):
         logits = self.head(hidden)  # (batch, N, vocab_size)
 
         outputs = {"logits": logits}
+        if use_cache:
+            outputs["past_key_values"] = presents
 
         # Shift logits and labels for next-token prediction. Padding should be
         # supplied via `labels` with -100 (see DataCollator) to be ignored.
-        if labels is None:
-            labels = x
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss = self.loss_fn(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
-        outputs["loss"] = loss
+        # Skipped during cached decoding (single-token steps have no shift target).
+        if not use_cache:
+            if labels is None:
+                labels = x
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = self.loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+            outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states

@@ -151,7 +151,9 @@ def test_gpt_init_std_is_sane(config):
 def test_context_output_shape(config):
     ctx = Context(config.dim_embd, config.n_heads)
     x = torch.randn(4, 16, config.dim_embd)
-    assert ctx(x).shape == (4, 16, config.dim_embd)
+    out, present = ctx(x)
+    assert out.shape == (4, 16, config.dim_embd)
+    assert present is None  # no cache requested
 
 
 def test_gpt_dropout_active_in_train_only(config):

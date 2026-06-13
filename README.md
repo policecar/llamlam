@@ -72,6 +72,11 @@ python -m pytest tests/    # everything, including slow overfit tests
 make lint                  # ruff check + format check
 ```
 
-## TeuxDeux
+## Generation
 
-- KV cache for faster generation.
+`model.generate(tokenizer, prompt, ...)` decodes greedily by default; pass
+`do_sample=True` with `temperature` / `top_k` / `top_p` for sampling. It uses a
+KV cache (per-layer key/value reuse) so each new token costs O(seq) instead of
+re-encoding the whole prefix; near the `max_seq_length` boundary it falls back
+to re-prefilling the cropped window (learned positional embeddings only span
+`max_seq_length`).

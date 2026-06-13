@@ -26,6 +26,21 @@ def _build_additive_mask(attention_mask, input_ids, dtype):
     return bias
 
 
+def _causal_cross_mask(q_len, k_len, dtype, device):
+    """Additive (1, 1, q_len, k_len) causal mask for cached decoding.
+
+    Query row i has absolute position (k_len - q_len + i) and may attend to keys
+    0..that position. Reduces to a standard causal mask when q_len == k_len, and
+    to all-allowed when q_len == 1.
+    """
+    past = k_len - q_len
+    i = torch.arange(q_len, device=device).view(q_len, 1)
+    j = torch.arange(k_len, device=device).view(1, k_len)
+    bias = torch.zeros(q_len, k_len, dtype=dtype, device=device)
+    bias.masked_fill_(j > past + i, float("-inf"))
+    return bias.view(1, 1, q_len, k_len)
+
+
 class LayerNorm(nn.Module):
     """
     LayerNorm as described in https://arxiv.org/abs/1607.06450
@@ -74,7 +89,7 @@ class Context(nn.Module):
         self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
         # Weights are initialized centrally in GPTModel._init_weights.
 
-    def forward(self, x, attn_mask=None):
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
@@ -84,6 +99,12 @@ class Context(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
+
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)  # extend along the sequence axis
+            v = torch.cat([past_v, v], dim=2)
+        present = (k, v) if use_cache else None
 
         if attn_mask is None:
             # Fast path: let SDPA build the causal mask (and pick a fused kernel).
@@ -95,7 +116,7 @@ class Context(nn.Module):
             batch_size, seq_length, self.dim_embd
         )
         output = self.out_proj(attn_output)
-        return output
+        return output, present
 
 
 class Block(nn.Module):
@@ -122,14 +143,16 @@ class Block(nn.Module):
         self.norm_1 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
         self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
-    def forward(self, x, attn_mask=None):
-        attn = self.context(self.norm_1(x), attn_mask=attn_mask)
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
+        attn, present = self.context(
+            self.norm_1(x), attn_mask=attn_mask, past_kv=past_kv, use_cache=use_cache
+        )
         attn = self.dropout(attn)
         x = x + attn
         mlp = self.feedforward(self.norm_2(x))
         mlp = self.dropout(mlp)
         x = x + mlp
-        return x
+        return x, present
 
 
 class GPTModel(nn.Module):
@@ -178,35 +201,54 @@ class GPTModel(nn.Module):
         attention_mask=None,
         labels=None,
         output_hidden_states=False,
+        past_key_values=None,
+        use_cache=False,
     ):
-        attn_mask = _build_additive_mask(
-            attention_mask, input_ids, self.embed.weight.dtype
-        )
+        T = input_ids.size(1)
+        past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
+        dtype = self.embed.weight.dtype
+
+        if past_len > 0 or use_cache:
+            # Incremental / cached decoding: queries are the new tokens, keys span
+            # the cached prefix too. (Right-padding masks aren't combined here;
+            # generation runs a single un-padded sequence.)
+            attn_mask = _causal_cross_mask(T, past_len + T, dtype, input_ids.device)
+        else:
+            attn_mask = _build_additive_mask(attention_mask, input_ids, dtype)
 
         hidden_states = []
-        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]
+        x = self.embed(input_ids) + self.pos_embed[:, past_len : past_len + T, :]
         if output_hidden_states:
             hidden_states.append(x)
 
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+        presents = []
+        for i, block in enumerate(self.blocks):
+            past = past_key_values[i] if past_key_values is not None else None
+            x, present = block(
+                x, attn_mask=attn_mask, past_kv=past, use_cache=use_cache
+            )
+            presents.append(present)
             if output_hidden_states:
                 hidden_states.append(x)
 
         x = self.ln_f(x)
         logits = self.head(x).float()
         outputs = {"logits": logits}
+        if use_cache:
+            outputs["past_key_values"] = presents
 
         # Default to next-token labels derived from the inputs; padding should be
         # supplied via `labels` with -100 (see DataCollator) to be ignored.
-        if labels is None:
-            labels = input_ids
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        loss = self.loss_fn(
-            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-        )
-        outputs["loss"] = loss
+        # Skipped during cached decoding (single-token steps have no shift target).
+        if not use_cache:
+            if labels is None:
+                labels = input_ids
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = self.loss_fn(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+            outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states
