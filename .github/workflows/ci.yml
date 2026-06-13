@@ -20,7 +20,7 @@ jobs:
           python -m pip install --upgrade pip
           # CPU-only torch is enough for the (network-free) test suite.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install "numpy<2" "ruff==0.7.3" pytest
+          pip install "numpy<2" "ruff==0.15.8" pytest
 
       - name: Lint
         run: ruff check .
