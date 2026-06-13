@@ -54,6 +54,8 @@ class Config:
     n_warmup_steps: int = 100               # int([0.01, 0.2] * total_steps)
     bfloat16: dict[str, bool] = field(default_factory=lambda: {"enabled": False})
     gradient_clipping: float = 1.0
+    keep_k_checkpoints: int = 3              # number of best checkpoints to retain
+    resume_from: Optional[str] = None        # checkpoint dir, or "latest", to resume from
 
 
     def __post_init__(self):

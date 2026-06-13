@@ -37,6 +37,12 @@ Key flags (see `python -m llamlam.train --help` and `llamlam/config.py`):
 - `--model_type {diff,gpt}` — architecture to train.
 - `--optimizer {adamw,muon,grokadamw}` — optimizer (`llamlam/opt.py`).
 - `--mixed_precision {no,fp16,bf16}` — passed to `Accelerator`.
+- `--resume_from <dir>|latest` — resume from a checkpoint (counters restored;
+  the interrupted epoch restarts).
+- `--keep_k_checkpoints N` — retain the N best-validation checkpoints.
+
+Checkpoints land under `data/runs/<run>/`: `last/` (most recent, always
+resumable) and `ckpt_<step>/` (the k best by validation loss).
 
 ### DeepSpeed (multi-GPU)
 
@@ -68,5 +74,4 @@ make lint                  # ruff check + format check
 
 ## TeuxDeux
 
-- Resume training from a checkpoint; keep only the k best checkpoints.
 - KV cache for faster generation.

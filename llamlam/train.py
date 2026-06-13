@@ -19,7 +19,14 @@ from llamlam.data import DataCollator
 
 from llamlam.difftransformer import DiffTransformer
 from llamlam.model import GPTModel
-from llamlam.utils import build_optimizer, evaluate, set_seed
+from llamlam.utils import (
+    CheckpointManager,
+    build_optimizer,
+    evaluate,
+    load_checkpoint,
+    resolve_resume_dir,
+    set_seed,
+)
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -83,6 +90,16 @@ if __name__ == "__main__":
         choices=["no", "fp16", "bf16"],
         help="Mixed-precision mode passed to Accelerator",
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        help="Checkpoint dir, or 'latest', to resume training from",
+    )
+    parser.add_argument(
+        "--keep_k_checkpoints",
+        type=int,
+        help="Number of best checkpoints to retain",
+    )
     args = parser.parse_args()
 
     # Load default config
@@ -95,11 +112,17 @@ if __name__ == "__main__":
                 setattr(config, arg_name, arg_value)
     logger.info(f"Arguments parsed: {vars(args)}")
 
-    # Create run directory
-    run_name = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = Path(__file__).resolve().parent.parent / "data" / "runs" / run_name
+    # Create (or, when resuming from an explicit checkpoint, reuse) the run dir.
+    runs_dir = Path(__file__).resolve().parent.parent / "data" / "runs"
+    if config.resume_from and config.resume_from != "latest":
+        # Continue writing into the run that owns the checkpoint.
+        output_dir = Path(config.resume_from).resolve().parent
+        run_name = output_dir.name
+    else:
+        run_name = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        output_dir = runs_dir / run_name
     os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Run directory created at: {output_dir}")
+    logger.info(f"Run directory: {output_dir}")
 
     # Set seed
     set_seed(seed=config.seed)
@@ -215,14 +238,28 @@ if __name__ == "__main__":
         model, optimizer, train_loader, val_loader, lr_scheduler
     )
 
+    ckpt_manager = CheckpointManager(output_dir, keep_k=config.keep_k_checkpoints)
+
     tokens_seen = 0
     global_step = 0
     best_val_loss = float("inf")
+    start_epoch = 0
 
-    # TODO: add resumption of training from a checkpoint
-    # https://github.com/huggingface/accelerate/blob/main/examples/complete_nlp_example.py#L175
+    # Resume is epoch-granular: counters are restored exactly, but an interrupted
+    # epoch is restarted from its beginning (the shuffled dataloader position is
+    # not persisted).
+    resume_dir = resolve_resume_dir(output_dir, config.resume_from)
+    if resume_dir is not None:
+        progress = load_checkpoint(accelerator, resume_dir)
+        global_step = progress.get("global_step", 0)
+        tokens_seen = progress.get("tokens_seen", 0)
+        best_val_loss = progress.get("best_val_loss", float("inf"))
+        start_epoch = progress.get("epoch", 0)
+        logger.info(
+            f"Resumed from {resume_dir}: epoch {start_epoch}, step {global_step}"
+        )
 
-    for epoch in range(config.n_epochs):
+    for epoch in range(start_epoch, config.n_epochs):
         train_loss = 0.0
         for batch in train_loader:
             model.train()
@@ -264,10 +301,17 @@ if __name__ == "__main__":
                     logger.info(
                         f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                     )
+                    progress = {
+                        "global_step": global_step,
+                        "tokens_seen": tokens_seen,
+                        "best_val_loss": min(val_loss, best_val_loss),
+                        "epoch": epoch,  # interrupted epoch restarts on resume
+                    }
+                    accelerator.wait_for_everyone()
+                    ckpt_manager.save_last(accelerator, progress)
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        accelerator.save_state(output_dir)
-                        # TODO: keep only the k best checkpoints
+                        ckpt_manager.save_best(accelerator, val_loss, progress)
 
                 wandb.log(
                     {
@@ -287,8 +331,17 @@ if __name__ == "__main__":
         # log validation loss and metric to wandb after each epoch
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 
-        # save checkpoint at end of each epoch
-        accelerator.save_state(output_dir)
+        # Save a resumable checkpoint at the end of each epoch.
+        accelerator.wait_for_everyone()
+        ckpt_manager.save_last(
+            accelerator,
+            {
+                "global_step": global_step,
+                "tokens_seen": tokens_seen,
+                "best_val_loss": best_val_loss,
+                "epoch": epoch + 1,  # resume continues with the next epoch
+            },
+        )
 
         # After each epoch, print a sample text
         # from safetensors.torch import load_file
