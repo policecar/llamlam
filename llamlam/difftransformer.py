@@ -270,9 +270,9 @@ class DiffTransformer(nn.Module):
         self.config = config
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
-        assert (
-            self.config.dim_embd % self.config.n_heads == 0
-        ), "dim_embd must be divisible by n_heads"
+        assert self.config.dim_embd % self.config.n_heads == 0, (
+            "dim_embd must be divisible by n_heads"
+        )
 
         self.token_emb = nn.Embedding(self.config.vocab_size, self.config.dim_embd)
         self.pos_emb = nn.Embedding(self.config.max_seq_length, self.config.dim_embd)
@@ -371,7 +371,9 @@ class DiffTransformer(nn.Module):
         temperature/top_k/top_p for sampling. See llamlam.utils.generate."""
         from llamlam.utils import generate
 
-        return generate(self, tokenizer, prompt, max_new_tokens=max_new_tokens, **kwargs)
+        return generate(
+            self, tokenizer, prompt, max_new_tokens=max_new_tokens, **kwargs
+        )
 
 
 # Example usage:
@@ -382,8 +384,8 @@ if __name__ == "__main__":
     # Define model hyperparameters
     config = Config(
         vocab_size=30522,
-        dim_embd=768,
         n_heads=12,
+        dim_head=64,  # dim_embd = n_heads * dim_head is derived in Config
         n_layers=12,
         max_seq_length=512,
     )

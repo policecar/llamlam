@@ -116,11 +116,14 @@ def main(
     n_epochs,
     lr_scheduler_type,
     n_warmup_steps,
+    bf16,
 ):
     set_seed(seed)
 
     if run_name is None:
-        run_name = f"ds_{model_type}_LR{learning_rate}_BS{batch_size}_L{n_layers}_H{n_heads}"
+        run_name = (
+            f"ds_{model_type}_LR{learning_rate}_BS{batch_size}_L{n_layers}_H{n_heads}"
+        )
 
     output_dir = Path(__file__).resolve().parent.parent / "data" / "output" / run_name
     os.makedirs(output_dir, exist_ok=True)

@@ -60,9 +60,9 @@ class Context(nn.Module):
         self.dim_embd = dim_embd
         self.n_heads = n_heads
         self.dim_head = dim_embd // n_heads  # because efficiency
-        assert (
-            self.dim_head * n_heads == dim_embd
-        ), "dim_head should be dim_embd // n_heads because efficiency"
+        assert self.dim_head * n_heads == dim_embd, (
+            "dim_head should be dim_embd // n_heads because efficiency"
+        )
 
         # Scale factor for dot-product attention: 1 / sqrt(d_k).
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -151,7 +151,9 @@ class GPTModel(nn.Module):
         # by 1/sqrt(2 * n_layers) so the residual stream stays unit-scale at depth.
         self.apply(self._init_weights)
         for name, param in self.named_parameters():
-            if name.endswith("out_proj.weight") or name.endswith("feedforward.2.weight"):
+            if name.endswith("out_proj.weight") or name.endswith(
+                "feedforward.2.weight"
+            ):
                 init.normal_(
                     param,
                     mean=0.0,
@@ -177,7 +179,9 @@ class GPTModel(nn.Module):
         labels=None,
         output_hidden_states=False,
     ):
-        attn_mask = _build_additive_mask(attention_mask, input_ids, self.embed.weight.dtype)
+        attn_mask = _build_additive_mask(
+            attention_mask, input_ids, self.embed.weight.dtype
+        )
 
         hidden_states = []
         x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]
@@ -227,4 +231,6 @@ class GPTModel(nn.Module):
         temperature/top_k/top_p for sampling. See llamlam.utils.generate."""
         from llamlam.utils import generate
 
-        return generate(self, tokenizer, prompt, max_new_tokens=max_new_tokens, **kwargs)
+        return generate(
+            self, tokenizer, prompt, max_new_tokens=max_new_tokens, **kwargs
+        )

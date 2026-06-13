@@ -253,7 +253,9 @@ if __name__ == "__main__":
                 global_step += 1
 
                 if global_step <= 10:
-                    logger.info(f"Epoch {epoch}, step {global_step}, loss {loss.item()}")
+                    logger.info(
+                        f"Epoch {epoch}, step {global_step}, loss {loss.item()}"
+                    )
 
                 if global_step % config.eval_steps == 0:
                     val_loss, perplexity = evaluate(
@@ -280,7 +282,7 @@ if __name__ == "__main__":
         avg_train_loss = train_loss / len(train_loader)
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
         logger.info(
-            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+            f"Epoch {epoch + 1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
         )
         # log validation loss and metric to wandb after each epoch
         wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})

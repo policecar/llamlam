@@ -12,7 +12,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from llamlam.config import Config
 from llamlam.difftransformer import DiffTransformer
 from llamlam.model import Block, Context, GPTModel
 from llamlam.utils import set_seed
