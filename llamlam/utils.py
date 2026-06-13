@@ -146,6 +146,71 @@ def get_grouped_params(model, weight_decay=0.1, no_decay=[]):
     return opt_grouped_params
 
 
+def get_device():
+    """Pick the best available device (cuda > mps > cpu)."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _filter_logits(logits, top_k=None, top_p=None):
+    """Apply top-k and/or nucleus (top-p) filtering to a (batch, vocab) logits tensor."""
+    if top_k is not None:
+        k = min(top_k, logits.size(-1))
+        threshold = torch.topk(logits, k, dim=-1).values[..., -1, None]
+        logits = logits.masked_fill(logits < threshold, float("-inf"))
+    if top_p is not None:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cum_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cum_probs > top_p
+        # keep at least the top token; shift the mask right by one
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        remove = remove.scatter(-1, sorted_idx, remove)
+        logits = logits.masked_fill(remove, float("-inf"))
+    return logits
+
+
+@torch.no_grad()
+def generate(
+    model,
+    tokenizer,
+    prompt,
+    max_new_tokens=100,
+    do_sample=False,
+    temperature=1.0,
+    top_k=None,
+    top_p=None,
+):
+    """Autoregressively generate text. Greedy by default; set do_sample=True for
+    temperature / top-k / top-p sampling. Shared by GPTModel and DiffTransformer.
+    """
+    device = get_device()
+    model.eval()
+    model.to(device)
+
+    token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    max_len = model.config.max_seq_length
+
+    for _ in range(max_new_tokens):
+        idx_cond = token_ids[:, -max_len:]  # crop to context window
+        logits = model(idx_cond)["logits"][:, -1, :]  # last-step logits
+
+        if not do_sample:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)
+        else:
+            logits = logits / max(temperature, 1e-6)
+            logits = _filter_logits(logits, top_k=top_k, top_p=top_p)
+            probs = torch.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+
+        token_ids = torch.cat((token_ids, idx_next), dim=1)
+
+    return tokenizer.decode(token_ids[0], skip_special_tokens=True)
+
+
 def save_checkpoint(
     model, optimizer, config, global_step, val_loss, tag, output_dir, max_ckpts=3
 ):
