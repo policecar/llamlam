@@ -28,6 +28,9 @@ class Config:
                                             # mixed_precision != "no" uses 8
 
     # Model config
+    model_type: str = "diff"                # "diff" (DiffTransformer) or "gpt" (GPTModel)
+    optimizer: str = "adamw"                # "adamw", "muon" or "grokadamw"
+    mixed_precision: str = "no"             # "no", "fp16" or "bf16" (passed to Accelerator)
     n_layers: int = 12                      # number of layers
     n_heads: int = 12                       # number of heads
     dim_head: int = 64                      # dimensionality of each attention head
@@ -36,6 +39,8 @@ class Config:
                                             # GPT-2 used True; here we default to False which is slightly faster, better
     dropout: float = 0.1                    # dropout rate
     # qkv_bias: bool = True                 # use bias in qkv projection
+    init_std: float = 0.02                  # std for weight init (GPT-2 style)
+    tie_word_embeddings: bool = True        # share weights between input embed and output head
 
     # Training config
     n_epochs: int = 3
@@ -49,6 +54,8 @@ class Config:
     n_warmup_steps: int = 100               # int([0.01, 0.2] * total_steps)
     bfloat16: dict[str, bool] = field(default_factory=lambda: {"enabled": False})
     gradient_clipping: float = 1.0
+    keep_k_checkpoints: int = 3              # number of best checkpoints to retain
+    resume_from: Optional[str] = None        # checkpoint dir, or "latest", to resume from
 
 
     def __post_init__(self):

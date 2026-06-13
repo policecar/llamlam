@@ -61,27 +61,8 @@ class GrokAdamW(Optimizer):
             gradient_clipping=gradient_clipping,
         )
         super(GrokAdamW, self).__init__(params, defaults)
-
-        # Pre-allocate state tensors and move to CUDA if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for group in self.param_groups:
-            for p in group["params"]:
-                state = self.state[p] = {}
-                state["step"] = 0
-                state["exp_avg"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-                state["exp_avg_sq"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-                state["grok_ema"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-
-                # Initialize tensors
-                state["exp_avg"].zero_()
-                state["exp_avg_sq"].zero_()
-                state["grok_ema"].zero_()
+        # State is created lazily in the first step, on each parameter's own
+        # device (so it works on CPU/MPS, and after the model is moved).
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -122,7 +103,7 @@ class GrokAdamW(Optimizer):
 
             # Function to apply parameter updates
             def _apply_updates():
-                self._update_group(group, params_with_grad, grads, grokking_signal)
+                self._update_group(group, params_with_grad, grads, grokking_signal)  # noqa: B023
 
             if use_amp:
                 with autocast():
@@ -154,15 +135,26 @@ class GrokAdamW(Optimizer):
         # Example: Taking the mean of all valid signals
         return sum(signals) / len(signals)
 
-    @staticmethod
     def _update_group(
+        self,
         group: dict,
         params: list[torch.Tensor],
         grads: list[torch.Tensor],
         grokking_signal: Optional[float],
     ) -> None:
         for i, (p, grad) in enumerate(zip(params, grads)):
-            state = group["state"][p]
+            state = self.state[p]
+            if len(state) == 0:  # lazy init on the parameter's device
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
+                state["grok_ema"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
             exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
             beta1, beta2 = group["betas"]
 
@@ -185,7 +177,7 @@ class GrokAdamW(Optimizer):
             # AdamW bias correction
             bias_correction1 = 1 - beta1 ** state["step"]
             bias_correction2 = 1 - beta2 ** state["step"]
-            step_size = group["lr"] * torch.sqrt(bias_correction2) / bias_correction1
+            step_size = group["lr"] * (bias_correction2**0.5) / bias_correction1
 
             # Decoupled weight decay (from AdamW)
             p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -319,8 +311,9 @@ class Muon(torch.optim.Optimizer):
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in params)
+            device = params[0].device if params else torch.device("cpu")
             updates_flat = torch.zeros(
-                total_params, device="cuda", dtype=torch.bfloat16
+                total_params, device=device, dtype=torch.bfloat16
             )
             curr_idx = 0
             for i, p in enumerate(params):

@@ -7,6 +7,40 @@ from torch.nn import functional as F
 from llamlam.activation import GELU
 
 
+def _build_additive_mask(attention_mask, input_ids, dtype):
+    """Combine the causal mask with an optional key-padding mask.
+
+    Returns an additive bias of shape (batch, 1, L, L) with 0.0 where attention
+    is allowed and -inf where it is masked, or None when no padding mask is given
+    (so SDPA can use its fused causal path).
+    """
+    if attention_mask is None:
+        return None
+    batch, L = input_ids.shape
+    device = input_ids.device
+    causal = torch.ones(L, L, dtype=torch.bool, device=device).tril()
+    key_pad = attention_mask.bool().view(batch, 1, 1, L)
+    keep = causal.view(1, 1, L, L) & key_pad  # (batch, 1, L, L)
+    bias = torch.zeros(batch, 1, L, L, dtype=dtype, device=device)
+    bias.masked_fill_(~keep, float("-inf"))
+    return bias
+
+
+def _causal_cross_mask(q_len, k_len, dtype, device):
+    """Additive (1, 1, q_len, k_len) causal mask for cached decoding.
+
+    Query row i has absolute position (k_len - q_len + i) and may attend to keys
+    0..that position. Reduces to a standard causal mask when q_len == k_len, and
+    to all-allowed when q_len == 1.
+    """
+    past = k_len - q_len
+    i = torch.arange(q_len, device=device).view(q_len, 1)
+    j = torch.arange(k_len, device=device).view(1, k_len)
+    bias = torch.zeros(q_len, k_len, dtype=dtype, device=device)
+    bias.masked_fill_(j > past + i, float("-inf"))
+    return bias.view(1, 1, q_len, k_len)
+
+
 class LayerNorm(nn.Module):
     """
     LayerNorm as described in https://arxiv.org/abs/1607.06450
@@ -35,35 +69,27 @@ class LayerNorm(nn.Module):
 
 
 class Context(nn.Module):
-    def __init__(self, dim_embd, n_heads, alpha=0.5):
+    def __init__(self, dim_embd, n_heads):
         super().__init__()
 
         self.dim_embd = dim_embd
         self.n_heads = n_heads
         self.dim_head = dim_embd // n_heads  # because efficiency
-        assert (
-            self.dim_head * n_heads == dim_embd
-        ), "dim_head should be dim_embd // n_heads because efficiency"
+        assert self.dim_head * n_heads == dim_embd, (
+            "dim_head should be dim_embd // n_heads because efficiency"
+        )
 
-        # Scale factor for dot product attention
+        # Scale factor for dot-product attention: 1 / sqrt(d_k).
         # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
         # "We suspect that for large values of d_k, the dot products grow large in magnitude,
         #  pushing the softmax function into regions where it has extremely small gradients.
         #  To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
-        self.scaling = self.dim_head**-0.5  # not used
-
+        # We let scaled_dot_product_attention apply the default 1/sqrt(dim_head).
         self.qkv_proj = nn.Linear(dim_embd, 3 * dim_embd, bias=False)
         self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
+        # Weights are initialized centrally in GPTModel._init_weights.
 
-        # Initialization for linear layers
-        for name, param in self.qkv_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
-        for name, param in self.out_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
-
-    def forward(self, x, mask=None):
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
@@ -74,14 +100,23 @@ class Context(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
 
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
-        )
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)  # extend along the sequence axis
+            v = torch.cat([past_v, v], dim=2)
+        present = (k, v) if use_cache else None
+
+        if attn_mask is None:
+            # Fast path: let SDPA build the causal mask (and pick a fused kernel).
+            attn_output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # attn_mask already encodes causality + key padding as an additive bias.
+            attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, seq_length, self.dim_embd
         )
         output = self.out_proj(attn_output)
-        return output
+        return output, present
 
 
 class Block(nn.Module):
@@ -95,11 +130,7 @@ class Block(nn.Module):
             GELU(),
             nn.Linear(4 * config.dim_embd, config.dim_embd),
         )
-        for name, param in self.feedforward.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=0.5 * (1 / config.dim_embd) ** 0.5)
-            else:
-                init.zeros_(param)
+        # Weights are initialized centrally in GPTModel._init_weights.
 
         # Alternative implementation using Conv1D
         # self.feedforward = nn.Sequential(
@@ -112,18 +143,20 @@ class Block(nn.Module):
         self.norm_1 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
         self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
-    def forward(self, x):
-        attn = self.context(self.norm_1(x))
+    def forward(self, x, attn_mask=None, past_kv=None, use_cache=False):
+        attn, present = self.context(
+            self.norm_1(x), attn_mask=attn_mask, past_kv=past_kv, use_cache=use_cache
+        )
         attn = self.dropout(attn)
         x = x + attn
         mlp = self.feedforward(self.norm_2(x))
         mlp = self.dropout(mlp)
         x = x + mlp
-        return x
+        return x, present
 
 
 class GPTModel(nn.Module):
-    def __init__(self, config, alpha=0.5):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.dim_embd)
@@ -133,37 +166,85 @@ class GPTModel(nn.Module):
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
         self.ln_f = nn.LayerNorm(config.dim_embd)
         self.head = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
         self.bias = config.bias
         self.dropout = config.dropout
 
-        init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
-        init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
+        # GPT-2 style init: normal(0, init_std), then scale residual projections
+        # by 1/sqrt(2 * n_layers) so the residual stream stays unit-scale at depth.
+        self.apply(self._init_weights)
+        for name, param in self.named_parameters():
+            if name.endswith("out_proj.weight") or name.endswith(
+                "feedforward.2.weight"
+            ):
+                init.normal_(
+                    param,
+                    mean=0.0,
+                    std=config.init_std / (2 * config.n_layers) ** 0.5,
+                )
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(
-            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
-        )
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        # Optionally tie the input embedding and the output projection.
+        if config.tie_word_embeddings:
+            self.head.weight = self.embed.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+            if module.bias is not None:
+                init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        labels=None,
+        output_hidden_states=False,
+        past_key_values=None,
+        use_cache=False,
+    ):
+        T = input_ids.size(1)
+        past_len = past_key_values[0][0].size(2) if past_key_values is not None else 0
+        dtype = self.embed.weight.dtype
+
+        if past_len > 0 or use_cache:
+            # Incremental / cached decoding: queries are the new tokens, keys span
+            # the cached prefix too. (Right-padding masks aren't combined here;
+            # generation runs a single un-padded sequence.)
+            attn_mask = _causal_cross_mask(T, past_len + T, dtype, input_ids.device)
+        else:
+            attn_mask = _build_additive_mask(attention_mask, input_ids, dtype)
 
         hidden_states = []
-        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]
+        x = self.embed(input_ids) + self.pos_embed[:, past_len : past_len + T, :]
         if output_hidden_states:
             hidden_states.append(x)
 
-        for block in self.blocks:
-            x = block(x)
+        presents = []
+        for i, block in enumerate(self.blocks):
+            past = past_key_values[i] if past_key_values is not None else None
+            x, present = block(
+                x, attn_mask=attn_mask, past_kv=past, use_cache=use_cache
+            )
+            presents.append(present)
             if output_hidden_states:
                 hidden_states.append(x)
 
         x = self.ln_f(x)
         logits = self.head(x).float()
         outputs = {"logits": logits}
+        if use_cache:
+            outputs["past_key_values"] = presents
 
-        if input_ids is not None:
+        # Default to next-token labels derived from the inputs; padding should be
+        # supplied via `labels` with -100 (see DataCollator) to be ignored.
+        # Skipped during cached decoding (single-token steps have no shift target).
+        if not use_cache:
+            if labels is None:
+                labels = input_ids
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-
+            shift_labels = labels[..., 1:].contiguous()
             loss = self.loss_fn(
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
@@ -187,59 +268,11 @@ class GPTModel(nn.Module):
         model.eval()
         return model
 
-    def generate(self, tokenizer, prompt, max_new_tokens=100):
-        """
-        Generate text from the model.
+    def generate(self, tokenizer, prompt, max_new_tokens=100, **kwargs):
+        """Generate text. Greedy by default; pass do_sample=True with
+        temperature/top_k/top_p for sampling. See llamlam.utils.generate."""
+        from llamlam.utils import generate
 
-        Args:
-            tokenizer: Tokenizer instance
-            prompt: Text to start generation with
-            max_new_tokens: Maximum number of new tokens to generate
-
-        Returns:
-            Decoded text
-        """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
+        return generate(
+            self, tokenizer, prompt, max_new_tokens=max_new_tokens, **kwargs
         )
-
-        self.eval()
-        self.to(device)
-
-        # Encode prompt
-        token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-
-        # TeuxDeux:
-        # - top_k
-        # - top_p
-        # - temperature
-
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                # Crop current context if it exceeds the supported context size
-                # E.g., if LLM supports only 5 tokens, and the context size is 10
-                # then only the last 5 tokens are used as context
-                idx_cond = token_ids[:, -self.config.max_seq_length :]
-
-                # Get the predictions
-                with torch.no_grad():
-                    logits = self(idx_cond)["logits"]
-
-                # Focus only on the last time step
-                # (batch, n_token, vocab_size) becomes (batch, vocab_size)
-                logits = logits[:, -1, :]
-
-                # Get the idx of the vocab entry with the highest logits value
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
-
-                # Append sampled index to the running sequence
-                token_ids = torch.cat(
-                    (token_ids, idx_next), dim=1
-                )  # (batch, n_tokens+1)
-
-        # Decode and return the generated text
-        return tokenizer.decode(token_ids[0], skip_special_tokens=True)
