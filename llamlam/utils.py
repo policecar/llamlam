@@ -1,6 +1,9 @@
+import math
+import random
+
 import numpy as np
 import torch
-import random
+import torch.nn as nn
 
 
 def set_seed(seed: int = 137):
@@ -15,8 +18,8 @@ def evaluate(model, dataloader, device=None, accelerator=None):
     """
     Evaluate the model on the given dataloader.
 
-    Assumes that the model computes its own labels from the inputs
-    and returns its loss.
+    Assumes that the model computes its own labels from the inputs and returns
+    the mean loss over its non-padded targets when given an attention_mask.
 
     Args:
         model: The model to evaluate.
@@ -24,71 +27,92 @@ def evaluate(model, dataloader, device=None, accelerator=None):
         accelerator: Optional; The accelerator to use. Defaults to None.
 
     Returns:
-        A tuple containing the loss and the perplexity.
+        A tuple (loss, perplexity): the mean loss over all real (non-padded)
+        target tokens, and exp of that loss.
     """
-    losses = []
+    # @decision DEC-001: token-weighted mean, reduced once across processes
+    # @rationale: batches have different numbers of real targets after padding is
+    #   masked, so a mean of per-batch means over-weights short batches. Summing
+    #   (loss * n_targets) and n_targets locally and reducing once keeps the result
+    #   identical with and without an accelerator.
+    loss_sum = None
+    n_targets = None
 
     model.eval()
-    for step, batch in enumerate(dataloader):
-        input_ids = batch["input_ids"]  # .to(device)
-        with torch.no_grad():
-            outputs = model(input_ids)
-        loss = outputs["loss"]
-        if accelerator is not None:
-            losses.append(accelerator.gather(loss.unsqueeze(0)))
+    for batch in dataloader:
+        input_ids = batch["input_ids"]
+        attention_mask = batch.get("attention_mask")
+        # Targets are positions 1..L-1; position t counts iff attention_mask[t] == 1
+        if attention_mask is not None:
+            batch_targets = attention_mask[:, 1:].sum()
         else:
-            losses.append(loss.unsqueeze(0))
-    loss = torch.mean(torch.cat(losses))
+            batch_targets = torch.tensor(
+                input_ids.size(0) * (input_ids.size(1) - 1), device=input_ids.device
+            )
+        batch_targets = batch_targets.to(torch.float32)
+        if batch_targets == 0:
+            continue  # all-padding batch: no targets, loss is undefined
+        with torch.no_grad():
+            loss = model(input_ids, attention_mask=attention_mask)["loss"]
+        weighted = loss.detach().to(torch.float32) * batch_targets
+        loss_sum = weighted if loss_sum is None else loss_sum + weighted
+        n_targets = batch_targets if n_targets is None else n_targets + batch_targets
     model.train()
 
+    if loss_sum is None:  # this process saw no targets; still join the reduce
+        device = accelerator.device if accelerator is not None else "cpu"
+        loss_sum = n_targets = torch.zeros((), dtype=torch.float32, device=device)
+    totals = torch.stack([loss_sum, n_targets])
+    if accelerator is not None:
+        totals = accelerator.reduce(totals, reduction="sum")
+    if totals[1] == 0:
+        raise ValueError("evaluate(): dataloader produced no non-padded targets")
+    loss = (totals[0] / totals[1]).item()
+
     try:
-        perplexity = torch.exp(loss).item()
+        perplexity = math.exp(loss)
     except OverflowError:
         perplexity = float("inf")
 
-    return loss.item(), perplexity
+    return loss, perplexity
 
 
-def get_grouped_params(model, weight_decay=0.1, no_decay=[]):
+def get_grouped_params(model, weight_decay=0.1):
     """
-    Get grouped parameters for the optimizer.
+    Get parameter groups for the optimizer.
 
-    This function groups model parameters for optimization, applying different
-    hyperparameters based on parameter type. E.g., embedding parameters may
-    require different learning rates, biases might be excluded from weight decay.
-
-    This approach allows for fine-grained control over parameter optimization.
+    Only the `weight` of nn.Linear and nn.Embedding modules is weight-decayed.
+    Every other parameter (biases, norm gains/scales, DiffTransformer lambdas,
+    raw nn.Parameter tensors such as GPTModel.pos_embed) gets weight_decay 0.
 
     Args:
         model: The model to get the grouped parameters for.
-        weight_decay: The weight decay to use. Defaults to 0.1.
-        no_decay: The parameters to not apply weight decay to.
+        weight_decay: The weight decay for Linear/Embedding weights. Defaults to 0.1.
 
     Returns:
-        A list of dictionaries containing the grouped parameters.
+        A list of two optimizer param-group dicts: decayed and non-decayed.
     """
-    opt_grouped_params = []
-    for n, p in model.named_parameters():
-        if p.requires_grad:
-            group_parameters = {}
-
-            # Define weight decay for all params except those in no_decay
-            if any(nd in n for nd in no_decay):
-                group_parameters["weight_decay"] = 0.0
+    # @decision DEC-002: decide weight decay by module type, not by name pattern
+    # @rationale: the old substring list ("LayerNorm.weight") matched no parameter,
+    #   so norm gains were decayed. Whitelisting Linear/Embedding weights holds for
+    #   any module naming (norm_1, ln_f, RMSNorm.scale, rms_scale, lambda_*), and a
+    #   new parameter type defaults to no decay instead of silently being decayed.
+    decay, no_decay = [], []
+    seen = set()
+    for module in model.modules():
+        for name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad or id(param) in seen:
+                continue  # skip frozen and tied (already grouped) parameters
+            seen.add(id(param))
+            if name == "weight" and isinstance(module, (nn.Linear, nn.Embedding)):
+                decay.append(param)
             else:
-                group_parameters["weight_decay"] = weight_decay
+                no_decay.append(param)
 
-            # # Define custom learning rate for specific types of params
-            # is_embed = "embed" in n
-            # if "embed" in n or any(nd in n for nd in no_decay):
-            #     group_parameters["lr"] = learning_rate * (3.3 if is_embed else 1.0)
-            # else:
-            #     group_parameters["lr"] = learning_rate * (1 / dim_head)
-
-            group_parameters["params"] = [p]
-            opt_grouped_params.append(group_parameters)
-
-    return opt_grouped_params
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
 
 
 def save_checkpoint(

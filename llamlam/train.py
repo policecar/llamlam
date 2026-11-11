@@ -1,5 +1,7 @@
 import argparse
+import dataclasses
 import logging
+import math
 import os
 import yaml
 
@@ -16,7 +18,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 
 from llamlam.config import Config
-from llamlam.data import DataCollator
+from llamlam.data import DataCollator, train_val_split
 
 from llamlam.difftransformer import DiffTransformer
 from llamlam.utils import evaluate, get_grouped_params, set_seed
@@ -26,32 +28,45 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 os.environ["MALLOC_DISABLE_WARNINGS"] = "1"
 
+logger = logging.getLogger(__name__)
 
-if __name__ == "__main__":
-    ##########################################
-    # Setup
-    ##########################################
+DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
 
-    # Set up logging
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
-    logger = logging.getLogger(__name__)
+# CLI options that configure the run itself rather than a Config field
+RUN_OPTIONS = ("debug", "output_dir", "run_name")
 
-    # Parse command-line arguments
+
+##########################################
+# Arguments & config
+##########################################
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Training script for LlamLam")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode")
+    parser.add_argument(
+        "--debug", action="store_true", help="Log at DEBUG level instead of INFO"
+    )
     parser.add_argument("--seed", type=int, help="Random seed")
     parser.add_argument(
-        "--output_dir", type=str, default="experiments", help="Output directory"
+        "--output_dir",
+        type=str,
+        help=f"Parent directory for run directories (default: {DEFAULT_RUNS_DIR})",
     )
-    parser.add_argument("--run_name", type=str, help="Run name")
-    parser.add_argument("--n_layer", type=int, help="Number of layers")
-    parser.add_argument("--n_head", type=int, help="Number of heads")
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        help="Run name, also the run directory name (default: test_<timestamp>)",
+    )
+    parser.add_argument(
+        "--n_layers", "--n_layer", dest="n_layers", type=int, help="Number of layers"
+    )
+    parser.add_argument(
+        "--n_heads", "--n_head", dest="n_heads", type=int, help="Number of heads"
+    )
     parser.add_argument(
         "--dim_head",
         type=int,
-        help="Dimension of each attention head, total dim is n_head * dim_head",
+        help="Dimension of each attention head, total dim is n_heads * dim_head",
     )
     parser.add_argument("--batch_size", type=int, help="Batch size for training")
     parser.add_argument("--n_epochs", type=int, help="Number of training epochs")
@@ -68,152 +83,144 @@ if __name__ == "__main__":
         help="Type of learning rate scheduler",
     )
     parser.add_argument("--n_warmup_steps", type=int, help="Number of warmup steps")
-    args = parser.parse_args()
+    return parser.parse_args(argv)
 
-    # Load default config
-    config = Config()
 
-    # Update config with parsed arguments
-    for arg_name, arg_value in vars(args).items():
-        if arg_value is not None:
-            if hasattr(config, arg_name):
-                setattr(config, arg_name, arg_value)
-    logger.info(f"Arguments parsed: {vars(args)}")
+def configure_logging(debug=False):
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, format="%(asctime)s - %(levelname)s - %(message)s")
+    logging.getLogger().setLevel(level)  # basicConfig is a no-op if already set up
 
-    # Create run directory
-    run_name = f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = Path(__file__).resolve().parent.parent / "data" / "runs" / run_name
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Run directory created at: {output_dir}")
 
-    # Set seed
-    set_seed(seed=config.seed)
-    logger.info(f"Using seed: {config.seed}")
-
-    accelerator = Accelerator()
-    device = accelerator.device
-
-    # device = torch.device(
-    #     "cuda"
-    #     if torch.cuda.is_available()
-    #     else "mps" if torch.backends.mps.is_available() else "cpu"
-    # )
-
-    ##########################################
-    # Initialize tokenizer & some
-    ##########################################
-
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.model_max_length = config.max_seq_length
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        # model.config.pad_token_id = model.config.eos_token_id
-    logger.info(f"Tokenizer initialized with vocabulary size: {len(tokenizer)}")
-
-    # Update model config with tokenizer vocabulary size
-    config.vocab_size = len(tokenizer)
-
-    ##########################################
-    # Init WandB, save config
-    ##########################################
-
-    # Init wandb
-    wandb.init(
-        project="llamlam",
-        name=run_name,
-        config={**config.__dict__},
-    )
-
-    # Save config to YAML file
-    config_path = output_dir / "config.yaml"
-    with open(config_path, "w") as f:
-        yaml.dump(config.__dict__, f)
-    logger.info(f"Config saved to: {config_path}")
-
-    ##########################################
-    # Load data, make dataloaders
-    ##########################################
-
-    try:
-        dataset = load_dataset(
-            path=config.data_path,
-            name=config.data_name if config.data_files is None else None,
-            data_files=config.data_files,
+def apply_overrides(config, overrides):
+    """Set each override on config; raise if any name is not a Config field."""
+    field_names = {f.name for f in dataclasses.fields(config)}
+    unknown = sorted(set(overrides) - field_names)
+    if unknown:
+        raise ValueError(
+            f"Cannot apply config override(s) {unknown}: not Config fields "
+            f"(valid: {sorted(field_names)})"
         )
-    except Exception as e:
-        raise ValueError(f"Failed to load dataset: {e}")
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    return config
 
-    # If there's no validation set, make one by splitting off 10% of the training set
-    if "validation" not in dataset:
-        dataset = dataset["train"].train_test_split(
-            test_size=min(2560, 0.1 * len(dataset["train"]))
-        )
 
-    # Drop all columns except 'text'
-    dataset = dataset.select_columns(["text"])
+def build_config(args, config=None):
+    """Default (or given) Config with every non-None CLI value applied."""
+    config = Config() if config is None else config
+    overrides = {
+        name: value
+        for name, value in vars(args).items()
+        if name not in RUN_OPTIONS and value is not None
+    }
+    return apply_overrides(config, overrides)
 
-    # Define collate function
-    collate_fn = DataCollator(tokenizer, config)
 
-    train_loader = DataLoader(
-        dataset["train"],
-        shuffle=True,
-        collate_fn=collate_fn,  # default_data_collator,
-        batch_size=config.batch_size,
-        num_workers=config.n_data_workers,
-        pin_memory=True,
-    )
-    val_loader = DataLoader(
-        dataset["test"],
-        shuffle=False,
-        collate_fn=collate_fn,
-        batch_size=config.batch_size,
-        num_workers=config.n_data_workers,
-        pin_memory=True,
-    )
+def resolve_run_dir(args):
+    """Return (run_name, run_dir) from --run_name / --output_dir."""
+    run_name = args.run_name or f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    parent = Path(args.output_dir) if args.output_dir else DEFAULT_RUNS_DIR
+    return run_name, parent / run_name
 
-    ##########################################
-    # Instantiate model
-    ##########################################
 
-    model = DiffTransformer(config)
-    # model = GPTModel(config)
-    # model.to(device)
+##########################################
+# Gradient accumulation
+##########################################
 
-    ##########################################
-    # Define optimizer
-    ##########################################
+# @decision DEC-001: an optimizer step after every `accum` micro-batches, plus one
+#   for a trailing partial group at the end of each epoch
+# @rationale: `step % accum == 0` stepped after the first micro-batch and left the
+#   epoch's last gradients to leak into the next epoch's first step. The trailing
+#   group's loss is divided by its real size so every step averages its micro-batches.
 
-    optimizer = AdamW(
-        get_grouped_params(
-            model, weight_decay=config.weight_decay, no_decay=config.no_decay
-        ),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
 
-    lr_scheduler = get_scheduler(
-        name=config.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=config.n_warmup_steps,
-        num_training_steps=config.n_epochs
-        * len(train_loader)
-        // config.gradient_accumulation_steps,
-    )
-    logger.info(f"Optimizer initialized with config: {config}")
+def is_accumulation_boundary(step, n_micro_batches, accum):
+    """True if the optimizer should step after micro-batch `step` (0-based)."""
+    return (step + 1) % accum == 0 or step + 1 == n_micro_batches
 
-    ##########################################
-    # Training loop
-    ##########################################
 
-    # ~"no specific order, we just need to unpack objects in the same order we gave them to the prepare method"
-    model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, lr_scheduler
-    )
+def accumulation_group_size(step, n_micro_batches, accum):
+    """Number of micro-batches in the accumulation group containing `step`."""
+    group_start = (step // accum) * accum
+    return min(accum, n_micro_batches - group_start)
 
-    val_losses = []
+
+def num_training_steps(n_epochs, n_micro_batches, accum):
+    """Optimizer steps taken over training (each epoch flushes a partial group)."""
+    return n_epochs * math.ceil(n_micro_batches / accum)
+
+
+##########################################
+# Checkpoints & sampling
+##########################################
+
+
+class CheckpointTracker:
+    """
+    Saves accelerator state to `<run_dir>/best` whenever validation loss improves
+    on the best seen so far, and to `<run_dir>/last` at the end of each epoch.
+    """
+
+    def __init__(self, accelerator, run_dir):
+        self.accelerator = accelerator
+        self.best_dir = Path(run_dir) / "best"
+        self.last_dir = Path(run_dir) / "last"
+        self.best_val_loss = math.inf
+
+    def update(self, val_loss):
+        """Save to best/ if val_loss beats the best so far; return whether it did."""
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.accelerator.save_state(self.best_dir)
+            # TODO: keep only the k best checkpoints
+            return True
+        return False
+
+    def save_last(self):
+        self.accelerator.save_state(self.last_dir)
+
+
+def sample_text(accelerator, model, tokenizer, prompt="Once upon a time"):
+    """Generate from the underlying model (the prepared one may be wrapped)."""
+    return accelerator.unwrap_model(model).generate(tokenizer, prompt=prompt)
+
+
+##########################################
+# Training loop
+##########################################
+
+
+def run_training(
+    model,
+    optimizer,
+    lr_scheduler,
+    train_loader,
+    val_loader,
+    accelerator,
+    config,
+    run_dir,
+    tokenizer=None,
+    log=None,
+):
+    """
+    Train for config.n_epochs. Objects are expected to be accelerator-prepared.
+
+    `log(metrics, step=None)` receives metrics (e.g. wandb.log); `tokenizer`, if
+    given, is used to print a sample after each epoch.
+
+    Returns a dict with best_val_loss, n_optimizer_steps and avg_train_loss
+    (of the last epoch).
+    """
+    log = log or (lambda *args, **kwargs: None)
+    accum = config.gradient_accumulation_steps
+    n_micro_batches = len(train_loader)
+    checkpoints = CheckpointTracker(accelerator, run_dir)
+
     tokens_seen = 0
     global_step = 0
+    n_optimizer_steps = 0
+    avg_train_loss = float("nan")
 
     # TODO: add resumption of training from a checkpoint
     # https://github.com/huggingface/accelerate/blob/main/examples/complete_nlp_example.py#L175
@@ -223,17 +230,22 @@ if __name__ == "__main__":
         optimizer.zero_grad()  # reset gradients
         for step, batch in enumerate(train_loader):
             model.train()
-            input_ids = batch["input_ids"]  # .to(device)
-            # attention_mask = batch["attention_mask"]  # .to(device)
-            loss = model(input_ids)["loss"]  # logits, (loss), (hidden_states)
-            loss = loss / config.gradient_accumulation_steps
-            accelerator.backward(loss)  # calculate loss gradients, loss.backward()
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            input_ids = batch["input_ids"]
+            attention_mask = batch.get("attention_mask")
+            loss = model(input_ids, attention_mask=attention_mask)["loss"]
+            # scale for accumulation only in backward; log the unscaled loss
+            group_size = accumulation_group_size(step, n_micro_batches, accum)
+            accelerator.backward(loss / group_size)
 
-            if step % config.gradient_accumulation_steps == 0:
+            if is_accumulation_boundary(step, n_micro_batches, accum):
+                if config.gradient_clipping:
+                    accelerator.clip_grad_norm_(
+                        model.parameters(), max_norm=config.gradient_clipping
+                    )
                 optimizer.step()  # update model parameters
                 lr_scheduler.step()  # update learning rate
                 optimizer.zero_grad()  # reset gradients
+                n_optimizer_steps += 1
 
             train_loss += loss.item()
             tokens_seen += input_ids.numel()
@@ -247,15 +259,11 @@ if __name__ == "__main__":
                 logger.info(
                     f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
-                if (global_step == 0) or (val_loss < min(val_losses)):
-                    best_val_loss = min(val_losses) if len(val_losses) else val_loss
-                    accelerator.save_state(output_dir)
-                    # TODO: keep only the k best checkpoints
-                val_losses.append(val_loss)
+                checkpoints.update(val_loss)
 
             global_step += 1
 
-            wandb.log(
+            log(
                 {
                     "train_loss": loss.item(),
                     "learning_rate": lr_scheduler.get_last_lr()[0],
@@ -264,29 +272,173 @@ if __name__ == "__main__":
                 step=global_step,
             )
 
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss / n_micro_batches
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
         logger.info(
             f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
         )
-        # log validation loss and metric to wandb after each epoch
-        wandb.log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
+        # log validation loss and metric after each epoch
+        log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
 
-        # save checkpoint at end of each epoch
-        accelerator.save_state(output_dir)
+        checkpoints.update(val_loss)
+        checkpoints.save_last()
 
         # After each epoch, print a sample text
-        # from safetensors.torch import load_file
-        # checkpoint = load_file(output_dir / "model.safetensors")
-        # model = Model(checkpoint["model_config"])
-        # model.load_state_dict(checkpoint)
-        # model.eval()
-        # from transformers import AutoTokenizer
-        # tokenizer = AutoTokenizer.from_pretrained("gpt2")
-        logger.info(model.generate(tokenizer, prompt="Once upon a time"))
+        if tokenizer is not None and accelerator.is_main_process:
+            logger.info(sample_text(accelerator, model, tokenizer))
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    return {
+        "best_val_loss": checkpoints.best_val_loss,
+        "n_optimizer_steps": n_optimizer_steps,
+        "avg_train_loss": avg_train_loss,
+    }
+
+
+def main(argv=None):
+    ##########################################
+    # Setup
+    ##########################################
+
+    args = parse_args(argv)
+    configure_logging(debug=args.debug)
+    config = build_config(args)
+    logger.info(f"Arguments parsed: {vars(args)}")
+
+    # Create run directory
+    run_name, output_dir = resolve_run_dir(args)
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Run directory created at: {output_dir}")
+
+    # Set seed
+    set_seed(seed=config.seed)
+    logger.info(f"Using seed: {config.seed}")
+
+    accelerator = Accelerator()
+
+    ##########################################
+    # Initialize tokenizer & some
+    ##########################################
+
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.model_max_length = config.max_seq_length
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info(f"Tokenizer initialized with vocabulary size: {len(tokenizer)}")
+
+    # Update model config with tokenizer vocabulary size
+    config.vocab_size = len(tokenizer)
+
+    ##########################################
+    # Init WandB, save config
+    ##########################################
+
+    wandb.init(
+        project="llamlam",
+        name=run_name,
+        config=config.to_dict(),
+    )
+
+    # Save config to YAML file
+    config_path = output_dir / "config.yaml"
+    with open(config_path, "w") as f:
+        yaml.dump(config.to_dict(), f)
+    logger.info(f"Config saved to: {config_path}")
+
+    ##########################################
+    # Load data, make dataloaders
+    ##########################################
+
+    try:
+        dataset = load_dataset(
+            path=config.data_path,
+            name=config.data_name if config.data_files is None else None,
+            data_files=config.data_files,
+        )
+    except Exception as e:
+        raise ValueError(f"Failed to load dataset: {e}") from e
+
+    # Use the dataset's validation split, or split one off the training set
+    train_set, val_set = train_val_split(dataset)
+
+    # Drop all columns except 'text'
+    train_set = train_set.select_columns(["text"])
+    val_set = val_set.select_columns(["text"])
+
+    # Define collate function
+    collate_fn = DataCollator(tokenizer, config)
+
+    train_loader = DataLoader(
+        train_set,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=config.batch_size,
+        num_workers=config.n_data_workers,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_set,
+        shuffle=False,
+        collate_fn=collate_fn,
+        batch_size=config.batch_size,
+        num_workers=config.n_data_workers,
+        pin_memory=True,
+    )
+
+    ##########################################
+    # Instantiate model
+    ##########################################
+
+    model = DiffTransformer(config)
+    # model = GPTModel(config)
+
+    ##########################################
+    # Define optimizer
+    ##########################################
+
+    optimizer = AdamW(
+        get_grouped_params(model, weight_decay=config.weight_decay),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
+    lr_scheduler = get_scheduler(
+        name=config.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=config.n_warmup_steps,
+        num_training_steps=num_training_steps(
+            config.n_epochs, len(train_loader), config.gradient_accumulation_steps
+        ),
+    )
+    logger.info(f"Optimizer initialized with config: {config}")
+
+    ##########################################
+    # Training loop
+    ##########################################
+
+    # ~"no specific order, we just need to unpack objects in the same order we gave them to the prepare method"
+    model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, lr_scheduler
+    )
+
+    run_training(
+        model,
+        optimizer,
+        lr_scheduler,
+        train_loader,
+        val_loader,
+        accelerator,
+        config,
+        output_dir,
+        tokenizer=tokenizer,
+        log=wandb.log,
+    )
+
     accelerator.end_training()
     wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
