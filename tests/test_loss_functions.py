@@ -1,14 +1,29 @@
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from llamlam.config import LMConfig
+from llamlam.config import Config
 from llamlam.model import GPTModel
+
+
+@pytest.fixture(autouse=True)
+def _seed():
+    torch.manual_seed(0)
 
 
 @pytest.fixture
 def model():
-    config = LMConfig(max_length=16, vocab_size=100, n_layer=2, n_head=2, head_width=8)
+    # dropout=0: tests compare the loss with logits from a separate forward pass
+    config = Config(
+        max_seq_length=16,
+        vocab_size=100,
+        n_layers=2,
+        n_heads=2,
+        dim_head=8,
+        dropout=0.0,
+    )
     return GPTModel(config)
 
 
@@ -59,17 +74,20 @@ def test_loss_backpropagation(model):
 
 
 def test_loss_with_padding(model):
+    """Targets whose attention_mask entry is 0 are excluded from the mean loss."""
     input_ids = torch.randint(0, 100, (4, 16))
-    input_ids[:, -4:] = model.config.vocab_size - 1  # Assume last token is padding
+    attention_mask = torch.ones(4, 16, dtype=torch.long)
+    attention_mask[:, -4:] = 0  # right padding
+    attention_mask[1, -7:] = 0  # sequences of different lengths
 
-    loss_with_padding = model(input_ids)["loss"]
+    loss_with_padding = model(input_ids, attention_mask=attention_mask)["loss"]
 
-    # Manually mask out padding
+    # Manually mask out padding: target t is dropped iff attention_mask[t] == 0
     logits = model(input_ids)["logits"]
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = input_ids[..., 1:].contiguous()
 
-    mask = (shift_labels != model.config.vocab_size - 1).float()
+    mask = attention_mask[..., 1:].float()
     manual_loss = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
@@ -80,40 +98,48 @@ def test_loss_with_padding(model):
     assert torch.allclose(
         loss_with_padding, manual_loss
     ), "Loss doesn't handle padding correctly"
+    assert not torch.allclose(
+        loss_with_padding, model(input_ids)["loss"]
+    ), "Padding mask had no effect on the loss"
 
 
 def test_loss_with_uniform_distribution(model):
+    """A head that outputs constant logits gives a loss of exactly ln(vocab_size)."""
     input_ids = torch.randint(0, 100, (4, 16))
 
-    # Set logits to uniform distribution
-    uniform_logits = torch.ones(4, 16, model.config.vocab_size)
-    model.head.weight.data.zero_()
-    model.head.bias.data.zero_()
+    # Zero the head (it has no bias): every logit is 0, i.e. uniform predictions
+    with torch.no_grad():
+        model.head.weight.zero_()
 
-    loss = F.cross_entropy(
-        uniform_logits.view(-1, uniform_logits.size(-1)), input_ids.view(-1)
-    )
-    expected_loss = torch.log(torch.tensor(model.config.vocab_size, dtype=torch.float))
+    output = model(input_ids)
+    assert torch.equal(output["logits"], torch.zeros_like(output["logits"]))
 
+    expected_loss = torch.tensor(math.log(model.config.vocab_size))
     assert torch.allclose(
-        loss, expected_loss
+        output["loss"], expected_loss
     ), "Loss for uniform distribution is incorrect"
 
 
 def test_loss_with_perfect_prediction(model):
+    """Logits that put all mass on the true next token give a loss of zero.
+
+    The head's output is replaced by one-hot logits for input_ids[:, t + 1] at
+    position t, so this also fails if the loss aligns logits and labels wrongly.
+    """
     input_ids = torch.randint(0, 100, (4, 16))
+    vocab_size = model.config.vocab_size
 
-    # Set logits to perfect prediction
-    perfect_logits = torch.zeros(4, 16, model.config.vocab_size)
-    perfect_logits.scatter_(2, input_ids.unsqueeze(-1), 1e9)
-    model.head.weight.data.zero_()
-    model.head.bias.data = perfect_logits[0, 0]
-
-    loss = model(input_ids)["loss"]
+    perfect_logits = torch.zeros(4, 16, vocab_size)
+    perfect_logits[:, :-1].scatter_(2, input_ids[:, 1:].unsqueeze(-1), 1e4)
+    handle = model.head.register_forward_hook(lambda m, i, o: perfect_logits)
+    try:
+        loss = model(input_ids)["loss"]
+    finally:
+        handle.remove()
 
     assert torch.allclose(
         loss, torch.tensor(0.0)
-    ), "Loss for perfect prediction is not zero"
+    ), f"Loss for perfect prediction is not zero: {loss.item()}"
 
 
 def test_loss_gradient_norm(model):
