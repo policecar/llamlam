@@ -7,6 +7,35 @@ import torch.nn.init as init
 from torch.nn import functional as F
 
 from llamlam.activation import GELU
+from llamlam.generation import generate as _generate
+
+
+def check_cache_inputs(n_new, past_key_values, n_layers, max_seq_length):
+    """
+    Validate a (possibly cached) forward call; return the cache length.
+
+    Shared by GPTModel and DiffTransformer. Learned absolute position
+    embeddings only exist for positions 0 .. max_seq_length - 1, so a cache
+    plus new tokens longer than that has no valid positions.
+
+    Raises:
+        ValueError: on a cache with the wrong number of layers, or a total
+            length (cache + new) above max_seq_length.
+    """
+    past_len = 0
+    if past_key_values is not None:
+        if len(past_key_values) != n_layers:
+            raise ValueError(
+                f"past_key_values has {len(past_key_values)} layers, "
+                f"the model has {n_layers}"
+            )
+        past_len = past_key_values[0][0].size(2)
+    if past_len + n_new > max_seq_length:
+        raise ValueError(
+            f"sequence length {past_len + n_new} (cache {past_len} + new {n_new}) "
+            f"exceeds max_seq_length {max_seq_length}"
+        )
+    return past_len
 
 
 def causal_lm_loss(loss_fn, logits, input_ids, attention_mask=None):
@@ -105,7 +134,24 @@ class Context(nn.Module):
             if "weight" in name:
                 init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, past_kv=None, use_cache=False):
+        """
+        Args:
+            x: [B, L, dim_embd], the new positions only when past_kv is given
+            mask: passed to SDPA alongside is_causal=True (no-cache path only)
+            past_kv: optional cached (K, V), each [B, n_heads, L_past, dim_head]
+            use_cache: if True, also return the updated (K, V)
+
+        Returns:
+            output [B, L, dim_embd], or (output, (K, V)) when use_cache is True.
+
+        @decision DEC-001: Without past_kv the attention call is unchanged
+        (is_causal=True, the fused causal path); only a call with past_kv uses
+        an explicit [L, L_past + L] causal mask.
+        @rationale: SDPA's is_causal aligns the mask top-left, which is wrong
+        once keys outnumber queries; keeping the old call elsewhere keeps the
+        training forward and the cache prefill bit-identical to before.
+        """
         batch_size, seq_length, _ = x.size()
         qkv = self.qkv_proj(x)
 
@@ -116,13 +162,30 @@ class Context(nn.Module):
 
         q, k, v = map(lambda t: t.transpose(1, 2), (q, k, v))  # [B n_heads L d]
 
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
-        )
+        if past_kv is None:
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
+            )
+        else:
+            if mask is not None:
+                raise ValueError("mask is not supported together with past_kv")
+            past_k, past_v = past_kv
+            k = torch.cat((past_k, k), dim=2)  # [B n_heads L_past+L d]
+            v = torch.cat((past_v, v), dim=2)
+            # Query i sits at absolute position L_past + i: it sees keys 0..L_past+i
+            past_len = k.size(2) - seq_length
+            cross_mask = torch.ones(
+                seq_length, k.size(2), dtype=torch.bool, device=x.device
+            ).tril(diagonal=past_len)
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=cross_mask, scale=1 / self.dim_head
+            )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, seq_length, self.dim_embd
         )
         output = self.out_proj(attn_output)
+        if use_cache:
+            return output, (k, v)
         return output
 
 
@@ -154,13 +217,18 @@ class Block(nn.Module):
         self.norm_1 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
         self.norm_2 = LayerNorm(config.dim_embd, bias=config.bias, eps=1e-5)
 
-    def forward(self, x):
-        attn = self.context(self.norm_1(x))
+    def forward(self, x, past_kv=None, use_cache=False):
+        """Returns x, or (x, (K, V)) when use_cache is True (see Context)."""
+        attn = self.context(self.norm_1(x), past_kv=past_kv, use_cache=use_cache)
+        if use_cache:
+            attn, present = attn
         attn = self.dropout(attn)
         x = x + attn
         mlp = self.feedforward(self.norm_2(x))
         mlp = self.dropout(mlp)
         x = x + mlp
+        if use_cache:
+            return x, present
         return x
 
 
@@ -182,19 +250,60 @@ class GPTModel(nn.Module):
         init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
         init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
-        position_ids = torch.arange(
-            0, input_ids.size(1), dtype=torch.long, device=input_ids.device
+    def forward(
+        self,
+        input_ids,
+        attention_mask=None,
+        output_hidden_states=False,
+        past_key_values=None,
+        use_cache=False,
+    ):
+        """
+        Args:
+            input_ids: [B, L] token ids (only the new tokens when cached)
+            attention_mask: optional [B, L], 1 = real token; excludes padded
+                targets from the loss (no loss, hence not allowed, when cached)
+            output_hidden_states: also return per-layer hidden states
+            past_key_values: optional per-layer (K, V) from a previous call
+            use_cache: return the updated per-layer (K, V) as "past_key_values"
+
+        Returns:
+            dict with "logits"; "loss" unless cached (use_cache or
+            past_key_values); "past_key_values" if use_cache; "hidden_states".
+
+        Raises:
+            ValueError: if cache + new length exceeds max_seq_length, the cache
+                has the wrong number of layers, or attention_mask is passed in
+                cached mode.
+        """
+        cached = use_cache or past_key_values is not None
+        if cached and attention_mask is not None:
+            raise ValueError(
+                "attention_mask only masks the loss, which cached mode does not compute"
+            )
+        seq_length = input_ids.size(1)
+        past_len = check_cache_inputs(
+            seq_length,
+            past_key_values,
+            len(self.blocks),
+            self.config.max_seq_length,
         )
-        position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
 
         hidden_states = []
-        x = self.embed(input_ids) + self.pos_embed[:, : input_ids.size(1), :]
+        x = (
+            self.embed(input_ids)
+            + self.pos_embed[:, past_len : past_len + seq_length, :]
+        )
         if output_hidden_states:
             hidden_states.append(x)
 
-        for block in self.blocks:
-            x = block(x)
+        presents = []
+        for i, block in enumerate(self.blocks):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            x = block(x, past_kv=past_kv, use_cache=use_cache)
+            if use_cache:
+                x, present = x
+                presents.append(present)
             if output_hidden_states:
                 hidden_states.append(x)
 
@@ -202,7 +311,9 @@ class GPTModel(nn.Module):
         logits = self.head(x).float()
         outputs = {"logits": logits}
 
-        if input_ids is not None:
+        if use_cache:
+            outputs["past_key_values"] = presents
+        if not cached:
             outputs["loss"] = causal_lm_loss(
                 self.loss_fn, logits, input_ids, attention_mask
             )
@@ -226,53 +337,9 @@ class GPTModel(nn.Module):
         model.eval()
         return model
 
-    def generate(self, tokenizer, prompt, max_new_tokens=100):
+    def generate(self, tokenizer, prompt, max_new_tokens=100, **kwargs):
         """
-        Generate text from the model.
-
-        Args:
-            tokenizer: Tokenizer instance
-            prompt: Text to start generation with
-            max_new_tokens: Maximum number of new tokens to generate
-
-        Returns:
-            Decoded text
+        Generate text from the model, greedy by default; see
+        llamlam.generation.generate for do_sample / temperature / top_k / top_p.
         """
-        # Generate where the model lives; never move it as a side effect
-        device = next(self.parameters()).device
-
-        self.eval()
-
-        # Encode prompt
-        token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-
-        # TeuxDeux:
-        # - top_k
-        # - top_p
-        # - temperature
-
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                # Crop current context if it exceeds the supported context size
-                # E.g., if LLM supports only 5 tokens, and the context size is 10
-                # then only the last 5 tokens are used as context
-                idx_cond = token_ids[:, -self.config.max_seq_length :]
-
-                # Get the predictions
-                with torch.no_grad():
-                    logits = self(idx_cond)["logits"]
-
-                # Focus only on the last time step
-                # (batch, n_token, vocab_size) becomes (batch, vocab_size)
-                logits = logits[:, -1, :]
-
-                # Get the idx of the vocab entry with the highest logits value
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
-
-                # Append sampled index to the running sequence
-                token_ids = torch.cat(
-                    (token_ids, idx_next), dim=1
-                )  # (batch, n_tokens+1)
-
-        # Decode and return the generated text
-        return tokenizer.decode(token_ids[0], skip_special_tokens=True)
+        return _generate(self, tokenizer, prompt, max_new_tokens, **kwargs)
