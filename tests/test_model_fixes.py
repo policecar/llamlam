@@ -1,7 +1,10 @@
 """
 Regression tests for review fixes shared by GPTModel and DiffTransformer:
-padding-aware loss, bias flag, str output_dir, causality, memorisation.
+padding-aware loss, bias flag, str output_dir, causality, generate device,
+memorisation.
 """
+
+import string
 
 import pytest
 import torch
@@ -206,6 +209,68 @@ def test_causality(model_cls):
         b = model(altered)["logits"]
     torch.testing.assert_close(a[:, :t], b[:, :t], rtol=0, atol=1e-5)
     assert not torch.allclose(a[:, t], b[:, t])
+
+
+# --------------------------------------------------------------------------- #
+# generate() runs on the model's device and never moves the model
+# --------------------------------------------------------------------------- #
+
+
+class StubTokenizer:
+    """Character-level tokenizer over the first vocab_size ASCII letters."""
+
+    def __init__(self, vocab_size):
+        self.alphabet = (string.ascii_letters + string.digits)[:vocab_size]
+        assert len(self.alphabet) == vocab_size
+
+    def encode(self, text, return_tensors=None):
+        assert return_tensors == "pt"
+        return torch.tensor([[self.alphabet.index(c) for c in text]])
+
+    def decode(self, ids, skip_special_tokens=False):
+        assert skip_special_tokens
+        return "".join(self.alphabet[i] for i in ids.tolist())
+
+
+def _greedy_reference(model, ids, n_new):
+    """Greedy decoding written out, cropping the context like generate()."""
+    with torch.no_grad():
+        for _ in range(n_new):
+            logits = model(ids[:, -model.config.max_seq_length :])["logits"]
+            ids = torch.cat((ids, logits[:, -1].argmax(-1, keepdim=True)), dim=1)
+    return ids
+
+
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_generate_keeps_cpu_model_on_cpu(model_cls, monkeypatch):
+    """Even when an accelerator is reported available, a CPU model stays put."""
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = build(model_cls)
+    tokenizer = StubTokenizer(model.config.vocab_size)
+    prompt = "abcde"
+    n_new = 20  # > max_seq_length - len(prompt): exercises context cropping
+
+    text = model.generate(tokenizer, prompt, max_new_tokens=n_new)
+
+    assert {p.device.type for p in model.parameters()} == {"cpu"}
+    assert {b.device.type for b in model.buffers()} <= {"cpu"}
+    assert len(text) == len(prompt) + n_new
+    assert text.startswith(prompt)
+    expected = _greedy_reference(
+        model, tokenizer.encode(prompt, return_tensors="pt"), n_new
+    )
+    assert text == tokenizer.decode(expected[0], skip_special_tokens=True)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+@pytest.mark.parametrize("model_cls", MODELS)
+def test_generate_runs_on_model_device_mps(model_cls):
+    model = build(model_cls).to("mps")
+    tokenizer = StubTokenizer(model.config.vocab_size)
+    text = model.generate(tokenizer, "abc", max_new_tokens=5)
+    assert {p.device.type for p in model.parameters()} == {"mps"}
+    assert len(text) == 3 + 5 and text.startswith("abc")
 
 
 @pytest.mark.parametrize("model_cls", MODELS)

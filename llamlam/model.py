@@ -238,16 +238,10 @@ class GPTModel(nn.Module):
         Returns:
             Decoded text
         """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        # Generate where the model lives; never move it as a side effect
+        device = next(self.parameters()).device
 
         self.eval()
-        self.to(device)
 
         # Encode prompt
         token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)

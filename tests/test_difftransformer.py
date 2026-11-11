@@ -59,10 +59,24 @@ def test_lambda_near_lambda_init_at_init():
             std = getattr(attn, name).std().item()
             assert 0.07 < std < 0.13, f"{name} std {std:.3f}"
         lam = attn.lambda_full()
-        assert lam.shape == (config.n_heads,)
+        assert lam.shape == ()  # one lambda per layer
         # std of (lambda - lambda_init) is ~0.08 here; std-1 init gave >> 1
         deviation = (lam - attn.lambda_init).abs().max().item()
         assert deviation < 0.5, f"lambda deviates from lambda_init by {deviation}"
+
+
+def test_one_lambda_per_layer_shared_by_all_heads():
+    """Reference: lambda_q1/k1/q2/k2 are (head_dim,), so lambda is one scalar."""
+    config = Config()
+    with torch.device("meta"):
+        model = DiffTransformer(config)
+    for layer in model.layers:
+        attn = layer.attn
+        for name in ("lambda_q1", "lambda_k1", "lambda_q2", "lambda_k2"):
+            assert getattr(attn, name).shape == (attn.dim_head,), name
+        assert attn.lambda_full().shape == ()
+    lambda_params = [n for n, _ in model.named_parameters() if ".attn.lambda_" in n]
+    assert len(lambda_params) == 4 * config.n_layers
 
 
 def test_lambda_init_schedule_matches_reference():
@@ -94,21 +108,30 @@ def test_reference_projection_layout():
     with torch.device("meta"):
         model = DiffTransformer(config)
     attn = model.layers[0].attn
-    assert attn.dim_head == d // config.n_heads // 2
+    # Reference: num_heads = half the baseline's; each softmax map has the
+    # width of a baseline head (6 differential heads of 2 x 64 at the default)
+    assert attn.n_heads == config.n_heads // 2 == 6
+    assert attn.dim_head == d // config.n_heads == config.dim_head == 64
     for proj in (attn.W_q, attn.W_k, attn.W_v, attn.W_o):
         assert proj.weight.shape == (d, d)
     assert attn.rms_scale.shape == (2 * attn.dim_head,)
-    assert attn.lambda_q1.shape == (config.n_heads, attn.dim_head)
+    assert attn.lambda_q1.shape == (attn.dim_head,)
     ff = model.layers[0].ff
     assert ff.WG.weight.shape == (8 * d // 3, d)
     assert ff.W1.weight.shape == (8 * d // 3, d)
     assert ff.W2.weight.shape == (d, 8 * d // 3)
 
 
-def test_dim_embd_not_divisible_by_two_heads_raises():
-    # dim_embd = 15 is divisible by n_heads = 3 but not by 2 * n_heads
+@pytest.mark.parametrize("n_heads", [0, 1, 3, 13])
+def test_odd_baseline_n_heads_raises(n_heads):
+    with pytest.raises(ValueError, match="n_heads .* must be even"):
+        DiffTransformer(small_config(n_heads=n_heads))
+
+
+def test_attention_dim_embd_not_divisible_by_two_heads_raises():
+    # dim_embd = 30 is not divisible by 2 * n_heads = 8 differential maps
     with pytest.raises(ValueError, match="divisible by 2 \\* n_heads"):
-        DiffTransformer(small_config(n_heads=3, dim_head=5))
+        MultiHeadDifferentialAttention(dim_embd=30, n_heads=4, lambda_init=0.5)
 
 
 def _reference_forward(attn, x):
@@ -121,7 +144,14 @@ def _reference_forward(attn, x):
     w = q @ k.transpose(-1, -2)
     w = w + torch.triu(torch.full((n, n), float("-inf")), 1)
     w = F.softmax(w, dim=-1).view(bsz, h, 2, n, n)
-    lam = attn.lambda_full().view(1, h, 1, 1)  # per-head here; scalar in reference
+    # Reference: lambda vectors are (head_dim,) -> one scalar for all heads.
+    # Computed from the parameters here, independently of lambda_full().
+    for name in ("lambda_q1", "lambda_k1", "lambda_q2", "lambda_k2"):
+        assert getattr(attn, name).shape == (hd,), name
+    lam_1 = torch.exp(torch.sum(attn.lambda_q1 * attn.lambda_k1, dim=-1).float())
+    lam_2 = torch.exp(torch.sum(attn.lambda_q2 * attn.lambda_k2, dim=-1).float())
+    lam = lam_1 - lam_2 + attn.lambda_init
+    assert lam.shape == ()
     w = w[:, :, 0] - lam * w[:, :, 1]
     out = w @ v
     out = out * torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + attn.eps)
@@ -133,7 +163,7 @@ def test_attention_matches_reference_forward():
     torch.manual_seed(0)
     attn = MultiHeadDifferentialAttention(dim_embd=64, n_heads=4, lambda_init=0.5)
     with torch.no_grad():
-        # Make lambda vectors non-trivial so per-head pairing matters
+        # Make lambda vectors non-trivial so a wrong lambda would show
         for name in ("lambda_q1", "lambda_k1", "lambda_q2", "lambda_k2"):
             getattr(attn, name).normal_(0, 0.5)
         attn.rms_scale.uniform_(0.5, 1.5)

@@ -58,8 +58,9 @@ class MultiHeadDifferentialAttention(nn.Module):
         """
         Args:
             dim_embd (int): Dimension of the model. Must be divisible by 2 * n_heads.
-            n_heads (int): Number of differential heads; each is a pair of softmax
-                maps over head_dim = dim_embd // n_heads // 2.
+            n_heads (int): Number of *differential* heads (half a baseline
+                Transformer's head count, as in the reference); each is a pair
+                of softmax maps over head_dim = dim_embd // n_heads // 2.
             lambda_init (float): Initial value for lambda.
 
         @decision DEC-001: Reference (unilm multihead_diffattn.py) projection layout:
@@ -67,6 +68,11 @@ class MultiHeadDifferentialAttention(nn.Module):
         components of head_dim, V holds n_heads values of 2 * head_dim.
         @rationale: Projecting to 2 * dim_embd doubled the attention weights
         (8 d^2 vs GPT's 4 d^2); this layout makes the layer parameter-matched.
+
+        @decision DEC-002: One lambda per layer, shared by all heads (reference).
+        @rationale: The reference's lambda_q1/k1/q2/k2 are (head_dim,) vectors,
+        giving a single scalar lambda per layer; per-head lambdas deviated
+        from the paper's formulation.
         """
         super().__init__()
         if dim_embd % (2 * n_heads) != 0:
@@ -86,11 +92,12 @@ class MultiHeadDifferentialAttention(nn.Module):
         self.W_v = nn.Linear(dim_embd, dim_embd, bias=False)
         self.W_o = nn.Linear(dim_embd, dim_embd, bias=False)
 
-        # Learnable parameters for lambda reparameterization.
+        # Learnable parameters for lambda reparameterization, shape (dim_head,):
+        # one lambda per layer, shared by all heads, as in the reference.
         # std 0.1 as in the paper/reference, so lambda ~= lambda_init at init
         # (std 1 made exp(q . k) range into the thousands for dim_head = 64).
         def _lambda_param():
-            return nn.Parameter(torch.zeros(n_heads, self.dim_head).normal_(0, 0.1))
+            return nn.Parameter(torch.zeros(self.dim_head).normal_(0, 0.1))
 
         self.lambda_q1 = _lambda_param()
         self.lambda_k1 = _lambda_param()
@@ -121,7 +128,7 @@ class MultiHeadDifferentialAttention(nn.Module):
         lambda = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
 
         Returns:
-            Tensor: shape (n_heads,)
+            Tensor: scalar (shape ()), shared by all heads of the layer
         """
         lambda_q1_dot_k1 = torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()
         lambda_q2_dot_k2 = torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()
@@ -156,12 +163,8 @@ class MultiHeadDifferentialAttention(nn.Module):
         Q1, Q2 = Q.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
         K1, K2 = K.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
 
-        # Compute lambda using reparameterization, shape (n_heads,)
+        # Compute lambda using reparameterization: one scalar for all heads
         lambda_val = self.lambda_full()
-
-        # Expand lambda_val to match attention dimensions
-        # Shape: (batch, n_heads, 1, 1)
-        lambda_val = lambda_val.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
 
         # ------------------- Causal Mask Implementation ------------------- #
         # Create a causal mask to prevent attention to future tokens
@@ -234,7 +237,8 @@ class DiffTransformerLayer(nn.Module):
         """
         Args:
             dim_embd (int): Dimension of the model.
-            n_heads (int): Number of attention heads.
+            n_heads (int): Number of differential heads (see
+                MultiHeadDifferentialAttention), not the baseline head count.
             lambda_init (float): Initial value for lambda in Differential Attention.
             dropout (float): Residual dropout rate (as in GPT's Block).
         """
@@ -278,14 +282,25 @@ class DiffTransformer(nn.Module):
         self.config = config
         self.loss_fn = nn.CrossEntropyLoss()
 
-        # dim_embd % (2 * n_heads) is checked in MultiHeadDifferentialAttention
+        # @decision DEC-003: config.n_heads is the baseline (GPT) head count; the
+        # model builds n_heads // 2 differential heads of two softmax maps each.
+        # @rationale: Reference ("num_heads set to half of baseline Transformer's
+        # num_heads"): each map then has a GPT head's width (config.dim_head),
+        # so one config compares both models like-for-like.
+        n_heads = self.config.n_heads
+        if n_heads < 2 or n_heads % 2 != 0:
+            raise ValueError(
+                f"n_heads ({n_heads}) must be even and >= 2 for DiffTransformer: "
+                "it is the baseline head count, and the model builds "
+                "n_heads // 2 differential heads of two softmax maps each"
+            )
         self.token_emb = nn.Embedding(self.config.vocab_size, self.config.dim_embd)
         self.pos_emb = nn.Embedding(self.config.max_seq_length, self.config.dim_embd)
         self.layers = nn.ModuleList(
             [
                 DiffTransformerLayer(
                     dim_embd=self.config.dim_embd,
-                    n_heads=self.config.n_heads,
+                    n_heads=n_heads // 2,
                     lambda_init=0.8
                     - 0.6 * math.exp(-0.3 * (l - 1)),  # Decaying lambda_init
                     dropout=self.config.dropout,
@@ -374,16 +389,10 @@ class DiffTransformer(nn.Module):
         Returns:
             Decoded text
         """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        # Generate where the model lives; never move it as a side effect
+        device = next(self.parameters()).device
 
         self.eval()
-        self.to(device)
 
         # Encode prompt
         token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
