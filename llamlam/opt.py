@@ -12,6 +12,14 @@ Up-and-coming optimizers:
     decay), as in torch.optim and upstream Muon 28c793b.
 @rationale: Unused parameters (e.g. frozen or conditionally used modules) must not
     move. In distributed Muon the owner's slot stays zero, so all ranks agree.
+@decision DEC-OPT-003: GrokAdamW bias-corrects the first moment with the layer-wise
+    beta1 it was accumulated with, not the plain beta1 (differs from upstream).
+@rationale: Upstream's mismatch makes early steps far too large for decayed layers;
+    see "Differences from upstream" in the GrokAdamW docstring.
+@decision DEC-OPT-004: GrokAdamW's layer-wise beta1 decay uses the parameter's position
+    normalised by its group size, so gamma spans the whole group (differs from upstream).
+@rationale: Upstream's raw position drives beta1 to ~0 for most tensors of a real
+    model; see "Differences from upstream" in the GrokAdamW docstring.
 """
 
 import math
@@ -24,6 +32,38 @@ from torch.optim.optimizer import Optimizer
 
 
 class GrokAdamW(Optimizer):
+    """AdamW with a Grokfast gradient filter and layer-wise beta1 decay.
+
+    Args:
+        params: Parameters or parameter groups to optimize.
+        lr, betas, eps, weight_decay: As in AdamW (decoupled weight decay).
+        alpha_init: Rate of the Grokfast gradient EMA (higher = slower EMA).
+        lamb: Weight of the Grokfast EMA added to the gradient.
+        gamma: Total fractional reduction of beta1 across a param group: the
+            group's first parameter uses beta1, its last beta1 * (1 - gamma),
+            geometrically in between. gamma=0 gives plain beta1 everywhere.
+        grokking_signal_fns: Callables whose mean (ignoring None) slows the EMA:
+            alpha = alpha_init * exp(-grokking_signal_decay_rate * signal).
+        grokking_signal_decay_rate: See grokking_signal_fns.
+        gradient_clipping: Per-tensor max gradient norm; 0 disables clipping.
+
+    Differences from upstream:
+        A. Bias correction (DEC-OPT-003). Before: the first moment was averaged
+           with the layer-wise beta1 but bias-corrected with the plain beta1
+           (1 - beta1 ** step). Now: it is corrected with 1 - layer_beta1 ** step.
+           Why: the correction must match the average it corrects. With upstream's
+           decay at the defaults, parameter index 10 has layer_beta1 ~= 0.314, so
+           its first step was (1 - 0.314) / (1 - 0.9) ~= 6.9x too large (fading
+           as steps accumulate).
+        B. Layer-wise decay (DEC-OPT-004). Before: layer_beta1 = beta1 *
+           (1 - gamma) ** i, with i the raw position in the param group. Now: the
+           exponent is i / (n - 1) for a group of n parameters (0 if n == 1).
+           Why: real groups hold dozens to hundreds of tensors and 0.9 ** 50 ~=
+           0.005, so most parameters trained with almost no momentum, depending on
+           how many tensors preceded them. Now the decay is gentle and spans the
+           group whatever its length.
+    """
+
     def __init__(
         self,
         params: Iterable[torch.Tensor],
@@ -158,6 +198,9 @@ class GrokAdamW(Optimizer):
                     "[0, 1]; signals must be non-negative."
                 )
 
+        # Positions run over the whole group, with or without grads (see _step_impl).
+        last_index = len(group["params"]) - 1
+
         for i, p in indexed_params:
             state = self.state[p]
             if len(state) == 0:
@@ -180,8 +223,9 @@ class GrokAdamW(Optimizer):
                 torch.nn.utils.clip_grad_norm_(p, group["gradient_clipping"])
             grad = p.grad
 
-            # Layer-wise momentum decay
-            layer_beta1 = beta1 * (1 - group["gamma"]) ** i
+            # Layer-wise momentum decay, normalised by group size (upstream diff B)
+            position = i / last_index if last_index > 0 else 0.0
+            layer_beta1 = beta1 * (1 - group["gamma"]) ** position
 
             # Grokfast component
             grok_ema = state["grok_ema"]
@@ -193,6 +237,7 @@ class GrokAdamW(Optimizer):
             exp_avg_sq.mul_(beta2).addcmul_(grok_grad, grok_grad, value=1 - beta2)
 
             # Bias correction must use the beta1 that exp_avg was accumulated with
+            # (upstream diff A)
             bias_correction1 = 1 - layer_beta1 ** state["step"]
             bias_correction2 = 1 - beta2 ** state["step"]
             step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1

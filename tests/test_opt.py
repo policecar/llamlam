@@ -152,6 +152,100 @@ def test_grokadamw_layer_beta_does_not_depend_on_other_params_grads():
     torch.testing.assert_close(finals[1][2], finals[0][2], rtol=0, atol=0)
 
 
+# Layer-wise beta1 is observed through exp_avg after two steps with gradients g1, g2
+# (lamb=0, no clipping => the Grokfast gradient is the raw gradient):
+# exp_avg = b * (1 - b) * g1 + (1 - b) * g2, which identifies b. float64, exact maths.
+_PLAIN = dict(lr=1e-2, eps=0.0, weight_decay=0.0, lamb=0.0, gradient_clipping=0.0)
+
+
+def _exp_avg_after_two_steps(b, g1, g2):
+    return b * (1 - b) * g1 + (1 - b) * g2
+
+
+def _two_steps(opt, params, grads1, grads2):
+    """grads*: one gradient (or None) per parameter, per step."""
+    for grads in (grads1, grads2):
+        for p, g in zip(params, grads):
+            p.grad = None if g is None else g.clone()
+        opt.step()
+
+
+def _randn64(*shape, seed):
+    return torch.randn(*shape, generator=torch.Generator().manual_seed(seed)).double()
+
+
+def test_grokadamw_layer_decay_spans_a_large_group():
+    """beta1 decays from beta1 (first param) to beta1 * (1 - gamma) (last param)
+    however many tensors the group holds. Upstream's raw-index exponent gave the
+    last of 200 params beta1 * 0.9 ** 199 ~= 7e-10, i.e. no momentum at all."""
+    n, beta1, beta2, gamma, lr = 200, 0.9, 0.999, 0.1, _PLAIN["lr"]
+    g1, g2 = _randn64(n, 3, seed=0), _randn64(n, 3, seed=1)
+    params = [nn.Parameter(torch.zeros(3, dtype=torch.float64)) for _ in range(n)]
+    opt = GrokAdamW(params, betas=(beta1, beta2), gamma=gamma, **_PLAIN)
+    _two_steps(opt, params, g1, g2)
+
+    for i in (0, n // 2, n - 1):
+        b = beta1 * (1 - gamma) ** (i / (n - 1))
+        exp_avg = opt.state[params[i]]["exp_avg"]
+        expected = _exp_avg_after_two_steps(b, g1[i], g2[i])
+        torch.testing.assert_close(exp_avg, expected, rtol=1e-12, atol=1e-15)
+        b_old = beta1 * (1 - gamma) ** i
+        if i > 0:  # non-vacuous: the old formula gives a clearly different state
+            old = _exp_avg_after_two_steps(b_old, g1[i], g2[i])
+            assert (expected - old).abs().max() > 0.1
+
+    # Bias correction uses the same beta1: replay Adam (eps=0) for the last param.
+    b, g1l, g2l = beta1 * (1 - gamma), g1[-1], g2[-1]
+    v2 = beta2 * (1 - beta2) * g1l**2 + (1 - beta2) * g2l**2
+    m2 = _exp_avg_after_two_steps(b, g1l, g2l)
+    expected_p = (
+        -lr * torch.sign(g1l)
+        - lr * math.sqrt(1 - beta2**2) / (1 - b**2) * m2 / v2.sqrt()
+    )
+    torch.testing.assert_close(params[-1].detach(), expected_p, rtol=1e-12, atol=1e-15)
+
+
+def test_grokadamw_layer_decay_counts_params_without_grad():
+    """Position and group size cover the whole group, not just the params that
+    have a gradient this step: with only the last two of five params trained,
+    they still use exponents 3/4 and 1."""
+    n, beta1, gamma = 5, 0.9, 0.5
+    g1, g2 = _randn64(n, 4, seed=2), _randn64(n, 4, seed=3)
+    params = [nn.Parameter(torch.zeros(4, dtype=torch.float64)) for _ in range(n)]
+    opt = GrokAdamW(params, betas=(beta1, 0.999), gamma=gamma, **_PLAIN)
+    mask = [None, None, None]
+    _two_steps(opt, params, mask + [g1[3], g1[4]], mask + [g2[3], g2[4]])
+
+    for p in params[:3]:
+        assert len(opt.state[p]) == 0
+    for i in (3, 4):
+        b = beta1 * (1 - gamma) ** (i / (n - 1))
+        expected = _exp_avg_after_two_steps(b, g1[i], g2[i])
+        torch.testing.assert_close(
+            opt.state[params[i]]["exp_avg"], expected, rtol=1e-12, atol=1e-15
+        )
+
+
+def test_grokadamw_single_param_group_uses_plain_beta1():
+    """Decay is per param group; a one-parameter group (exponent 0) uses beta1."""
+    beta1, gamma = 0.9, 0.5
+    g1, g2 = _randn64(4, 2, seed=4), _randn64(4, 2, seed=5)
+    params = [nn.Parameter(torch.zeros(2, dtype=torch.float64)) for _ in range(4)]
+    opt = GrokAdamW(
+        [{"params": params[:3]}, {"params": params[3:]}],
+        betas=(beta1, 0.999),
+        gamma=gamma,
+        **_PLAIN,
+    )
+    _two_steps(opt, params, g1, g2)
+
+    for i, b in ((2, beta1 * (1 - gamma)), (3, beta1)):
+        expected = _exp_avg_after_two_steps(b, g1[i], g2[i])
+        torch.testing.assert_close(
+            opt.state[params[i]]["exp_avg"], expected, rtol=1e-12, atol=1e-15
+        )
+
+
 def test_grokadamw_grokking_signal_fns_set_ema_rate():
     model = nn.Linear(4, 3)
     x = torch.randn(16, 4)
