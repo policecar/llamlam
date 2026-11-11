@@ -1,4 +1,7 @@
-"""Config derivation and CLI override handling (review item 6)."""
+"""
+Config derivation and CLI override handling (review item 6), and the
+model_type / optimizer / mixed_precision / checkpoint flags.
+"""
 
 import dataclasses
 import logging
@@ -6,13 +9,19 @@ from pathlib import Path
 
 import pytest
 import yaml
+from accelerate.state import AcceleratorState
 
-from llamlam.config import Config
+from llamlam.config import MIXED_PRECISION_MODES, MODEL_TYPES, OPTIMIZERS, Config
+from llamlam.difftransformer import DiffTransformer
+from llamlam.model import GPTModel
 from llamlam.train import (
     DEFAULT_RUNS_DIR,
+    MODEL_CLASSES,
     RUN_OPTIONS,
     apply_overrides,
+    build_accelerator,
     build_config,
+    build_model,
     configure_logging,
     parse_args,
     resolve_run_dir,
@@ -89,6 +98,122 @@ def test_run_dir_defaults():
     run_name, run_dir = resolve_run_dir(parse_args([]))
     assert run_name.startswith("test_")
     assert run_dir == Path(DEFAULT_RUNS_DIR) / run_name
+
+
+##########################################
+# model_type, optimizer, mixed_precision, checkpoint flags
+##########################################
+
+
+def test_new_choice_defaults():
+    config = Config()
+    assert (config.model_type, config.optimizer, config.mixed_precision) == (
+        "diff",
+        "adamw",
+        "no",
+    )
+    assert config.keep_k_checkpoints == 3
+    assert not hasattr(config, "bfloat16")  # replaced by mixed_precision
+
+
+def test_choice_flags_take_effect():
+    args = parse_args(
+        [
+            "--model_type", "gpt", "--optimizer", "muon",
+            "--mixed_precision", "bf16", "--keep_k_checkpoints", "5",
+        ]
+    )  # fmt: skip
+    config = build_config(args)
+    assert (config.model_type, config.optimizer, config.mixed_precision) == (
+        "gpt",
+        "muon",
+        "bf16",
+    )
+    assert config.keep_k_checkpoints == 5
+
+
+@pytest.mark.parametrize(
+    "flag, value",
+    [("--model_type", "llama"), ("--optimizer", "sgd"), ("--mixed_precision", "fp8")],
+)
+def test_invalid_choice_flags_rejected(flag, value):
+    with pytest.raises(SystemExit):
+        parse_args([flag, value])
+
+
+def test_choice_tuples_match_implementations():
+    assert tuple(MODEL_CLASSES) == MODEL_TYPES
+    assert OPTIMIZERS == ("adamw", "muon", "grokadamw")
+    assert MIXED_PRECISION_MODES == ("no", "fp16", "bf16")
+
+
+def test_resume_from_is_a_run_option_not_a_config_field(tmp_path):
+    args = parse_args(["--resume_from", "latest"])
+    assert args.resume_from == "latest"
+    assert "resume_from" not in {f.name for f in dataclasses.fields(Config)}
+    assert build_config(args) == Config()
+
+
+def tiny(model_type):
+    return Config(
+        model_type=model_type, n_layers=1, n_heads=2, dim_head=8, vocab_size=50,
+        max_seq_length=16,
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "model_type, cls", [("gpt", GPTModel), ("diff", DiffTransformer)]
+)
+def test_build_model_selects_class(model_type, cls):
+    model = build_model(tiny(model_type))
+    assert type(model) is cls
+
+
+def test_build_model_unknown_type_raises():
+    with pytest.raises(ValueError, match="model_type 'llama'"):
+        build_model(tiny("llama"))
+
+
+@pytest.fixture
+def fresh_accelerator_state():
+    # AcceleratorState is a process-wide singleton whose mixed_precision cannot
+    # change once set; reset it so each mode gets a real Accelerator
+    AcceleratorState._reset_state(reset_partial_state=True)
+    yield
+    AcceleratorState._reset_state(reset_partial_state=True)
+
+
+@pytest.mark.parametrize("mode", ["no", "bf16"])  # bf16 autocast exists on CPU
+def test_build_accelerator_passes_mixed_precision(mode, fresh_accelerator_state):
+    accelerator = build_accelerator(Config(mixed_precision=mode), cpu=True)
+    assert accelerator.mixed_precision == mode
+
+
+@pytest.mark.parametrize("mode", ["fp8", "bfloat16", "", None, True])
+def test_build_accelerator_rejects_invalid_mixed_precision(mode):
+    with pytest.raises(ValueError, match="mixed_precision"):
+        build_accelerator(Config(mixed_precision=mode), cpu=True)
+
+
+def test_resume_from_dir_continues_in_its_run(tmp_path):
+    ckpt = tmp_path / "my_run" / "last"
+    args = parse_args(["--resume_from", str(ckpt)])
+    assert resolve_run_dir(args) == ("my_run", tmp_path / "my_run")
+
+
+def test_explicit_run_flags_win_over_resume_dir(tmp_path):
+    ckpt = tmp_path / "old_run" / "last"
+    args = parse_args(
+        ["--resume_from", str(ckpt), "--output_dir", str(tmp_path), "--run_name", "new"]
+    )
+    assert resolve_run_dir(args) == ("new", tmp_path / "new")
+
+
+def test_resume_latest_uses_named_run(tmp_path):
+    args = parse_args(
+        ["--resume_from", "latest", "--output_dir", str(tmp_path), "--run_name", "r"]
+    )
+    assert resolve_run_dir(args) == ("r", tmp_path / "r")
 
 
 def test_debug_flag_sets_debug_log_level():

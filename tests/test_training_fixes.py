@@ -1,7 +1,8 @@
 """
 Training-loop fixes from the code review: padding masks in train/eval (item 1),
 gradient clipping (2), unscaled train-loss logging (3), gradient accumulation (4),
-best/last checkpoints (5), weight-decay groups (7), sampling via unwrap (10).
+best/last checkpoints (5, see also tests/test_checkpointing.py), weight-decay
+groups (7), sampling via unwrap (10).
 """
 
 import copy
@@ -21,11 +22,11 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 
+from llamlam.checkpoint import CheckpointManager
 from llamlam.config import Config
 from llamlam.difftransformer import DiffTransformer
 from llamlam.model import GPTModel
 from llamlam.train import (
-    CheckpointTracker,
     accumulation_group_size,
     is_accumulation_boundary,
     lr_schedule_steps,
@@ -365,25 +366,27 @@ def test_eval_skips_all_padding_batches_and_rejects_empty():
 ##########################################
 
 
-def test_checkpoint_tracker_keeps_best_separate_from_last(tmp_path):
+def test_checkpoint_manager_keeps_best_separate_from_last(tmp_path):
     accelerator = Accelerator(cpu=True)
     model = accelerator.prepare(tiny_model(tiny_config()))
-    tracker = CheckpointTracker(accelerator, tmp_path)
+    checkpoints = CheckpointManager(accelerator, tmp_path, keep_k=1)
 
-    assert tracker.update(3.0)
+    assert checkpoints.save_best(3.0, {"global_step": 1}) is not None
     with torch.no_grad():
         model.head.weight.fill_(1.0)
-    assert tracker.update(2.0)  # improvement: saved as best
+    best_dir = checkpoints.save_best(2.0, {"global_step": 2})  # improvement: saved
+    assert best_dir == tmp_path / "ckpt_000002"
     with torch.no_grad():
         model.head.weight.fill_(3.0)
-    assert not tracker.update(2.5)  # worse: best untouched
-    tracker.save_last()
+    assert checkpoints.save_best(2.5, {"global_step": 3}) is None  # worse: untouched
+    checkpoints.save_last({"global_step": 3})
 
-    best = load_file(tmp_path / "best" / "model.safetensors")
+    best = load_file(best_dir / "model.safetensors")
     last = load_file(tmp_path / "last" / "model.safetensors")
     assert torch.all(best["head.weight"] == 1.0)
     assert torch.all(last["head.weight"] == 3.0)
-    assert tracker.best_val_loss == 2.0
+    assert checkpoints.best == [(2.0, "ckpt_000002")]
+    assert not (tmp_path / "ckpt_000001").exists()  # pruned to keep_k=1
 
 
 def test_run_training_best_includes_end_of_epoch_evals(tmp_path, accelerator):
@@ -407,7 +410,10 @@ def test_run_training_best_includes_end_of_epoch_evals(tmp_path, accelerator):
     epoch_vals = [m["val_loss"] for m in logged if "val_loss" in m]
     assert len(epoch_vals) == 2
     assert result["best_val_loss"] == pytest.approx(min([step0_val, *epoch_vals]))
-    assert (tmp_path / "best").is_dir() and (tmp_path / "last").is_dir()
+    # keep_k=3 keeps all three evaluations: after micro-batch 1, epoch 0 (4), epoch 1 (8)
+    kept = sorted(p.name for p in tmp_path.glob("ckpt_*"))
+    assert kept == ["ckpt_000001", "ckpt_000004", "ckpt_000008"]
+    assert (tmp_path / "last").is_dir()
 
 
 ##########################################

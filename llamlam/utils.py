@@ -4,6 +4,10 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.optim.adamw import AdamW
+
+from llamlam.config import OPTIMIZERS, check_choice
+from llamlam.opt import GrokAdamW, Muon
 
 
 def set_seed(seed: int = 137):
@@ -115,15 +119,98 @@ def get_grouped_params(model, weight_decay=0.1):
     ]
 
 
-def save_checkpoint(
-    model, optimizer, config, global_step, val_loss, tag, output_dir, max_ckpts=3
-):
-    """Save checkpoint to output directory."""
-    checkpoint = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "config": config,
-        "iter_num": global_step,
-        "best_val_loss": val_loss,
+def muon_param_split(model):
+    """
+    Split trainable parameters into (muon, adamw) lists for the Muon optimizer.
+
+    Muon gets the weight matrices of hidden nn.Linear layers. The AdamW path gets
+    everything else: embeddings (nn.Embedding weights, raw positional parameters
+    such as GPTModel.pos_embed), the output head (`model.head`), biases, norm
+    gains and other 0/1-D parameters. Tied parameters appear once.
+    """
+    head = getattr(model, "head", None)
+    if not isinstance(head, nn.Linear):
+        raise ValueError(
+            "Muon routing needs the output projection at `model.head` (nn.Linear) "
+            f"to keep it out of the Muon group; {type(model).__name__} has none"
+        )
+    muon, adamw = [], []
+    seen = set()
+    for module in model.modules():
+        for name, param in module.named_parameters(recurse=False):
+            if not param.requires_grad or id(param) in seen:
+                continue
+            seen.add(id(param))
+            is_hidden_matrix = (
+                isinstance(module, nn.Linear)
+                and name == "weight"
+                and param.ndim == 2
+                and param is not head.weight  # the head's, or a weight tied to it
+            )
+            if is_hidden_matrix:
+                muon.append(param)
+            else:
+                adamw.append(param)
+    return muon, adamw
+
+
+# @decision DEC-003: one constructor for all optimizers, with the weight-decay
+#   grouping of get_grouped_params everywhere it applies, and every learning rate
+#   held in param_group["lr"] (or a fixed ratio of it) so the LR scheduler drives it
+# @rationale: the PR gave Muon's internal AdamW a single adamw_wd for all its
+#   parameters, which decays norm gains and biases; here those go into a second
+#   Muon param group with adamw_wd=0, matching AdamW/GrokAdamW. Muon stores its
+#   AdamW lr as adamw_lr / lr times group["lr"], so a LambdaLR scales both paths.
+def build_optimizer(model, config):
+    """
+    Construct the optimizer named by config.optimizer ("adamw", "muon", "grokadamw").
+
+    - adamw: torch AdamW over get_grouped_params(model, config.weight_decay).
+    - grokadamw: llamlam.opt.GrokAdamW over the same groups; its per-tensor
+      gradient clipping uses config.gradient_clipping (0 or None disables it).
+    - muon: llamlam.opt.Muon with muon_param_split(model); Muon steps use
+      lr=config.learning_rate (no weight decay, as in Muon itself), the AdamW path
+      also lr=config.learning_rate, with config.weight_decay on the Linear /
+      Embedding weights it holds (embeddings, head) and 0 on the rest.
+
+    Raises ValueError for an unknown optimizer name.
+    """
+    name = check_choice("optimizer", config.optimizer, OPTIMIZERS)
+    lr, weight_decay = config.learning_rate, config.weight_decay
+
+    if name == "adamw":
+        return AdamW(
+            get_grouped_params(model, weight_decay=weight_decay),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
+    if name == "grokadamw":
+        return GrokAdamW(
+            get_grouped_params(model, weight_decay=weight_decay),
+            lr=lr,
+            weight_decay=weight_decay,
+            gradient_clipping=config.gradient_clipping or 0.0,
+        )
+
+    # muon
+    muon_params, adamw_params = muon_param_split(model)
+    decay_ids = {
+        id(p) for p in get_grouped_params(model, weight_decay=weight_decay)[0]["params"]
     }
-    torch.save(checkpoint, output_dir / f"ckpt_{tag}.pt")
+    adamw_decay = [p for p in adamw_params if id(p) in decay_ids]
+    adamw_no_decay = [p for p in adamw_params if id(p) not in decay_ids]
+    optimizer = Muon(
+        muon_params,
+        lr=lr,
+        adamw_params=adamw_decay,
+        adamw_lr=lr,
+        adamw_wd=weight_decay,
+    )
+    if adamw_no_decay:
+        # Same defaults (lr, adamw_lr_ratio, betas) apart from the weight decay;
+        # Muon reads state["use_muon"] for every parameter it steps.
+        optimizer.add_param_group({"params": adamw_no_decay, "adamw_wd": 0.0})
+        for p in adamw_no_decay:
+            optimizer.state[p]["use_muon"] = False
+    return optimizer

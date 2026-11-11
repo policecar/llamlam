@@ -8,34 +8,38 @@ MIN_TOKENS = 2  # one input token plus one target
 FILTER_BATCH_SIZE = 1000
 
 
+# @decision DEC-002: pad each batch to its longest example (dynamic padding), not to
+#   max_seq_length
+# @rationale: padded positions cost a full forward/backward but carry no target
+#   (the attention_mask excludes them from the loss, see model.causal_lm_loss), so
+#   short batches no longer pay for max_seq_length. Attention is causal and padding
+#   is on the right, so real positions are unaffected by how much padding follows:
+#   loss and evaluate() are invariant to the padded length (tests/test_data.py).
 class DataCollator:
+    """
+    Tokenize a batch of {"text": ...} examples into input_ids and attention_mask.
+
+    Each example is truncated to config.max_seq_length tokens, and the batch is
+    right-padded to its longest example, rounded up to a multiple of
+    config.pad_to_multiple_of when that is set (the tokenizer raises if
+    max_seq_length is not a multiple of it). No labels: the model derives its
+    targets from input_ids and masks padded ones with the attention_mask.
+    """
+
     def __init__(self, tokenizer, config):
         self.tokenizer = tokenizer
         self.config = config
 
     def __call__(self, examples):
-        examples = [example["text"] for example in examples]
-        if self.config.pad_to_multiple_of is not None:
-            # Pad to the longest example in the batch, rounded up to a multiple of
-            # pad_to_multiple_of; the tokenizer raises if max_seq_length is not a
-            # multiple of it.
-            batch = self.tokenizer(
-                examples,
-                padding=True,
-                max_length=self.config.max_seq_length,
-                pad_to_multiple_of=self.config.pad_to_multiple_of,
-                truncation=True,
-                return_tensors="pt",
-            )
-        else:
-            batch = self.tokenizer(
-                examples,
-                padding="max_length",
-                max_length=self.config.max_seq_length,
-                truncation=True,
-                return_tensors="pt",
-            )
-        return batch
+        texts = [example["text"] for example in examples]
+        return self.tokenizer(
+            texts,
+            padding="longest",
+            max_length=self.config.max_seq_length,
+            pad_to_multiple_of=self.config.pad_to_multiple_of,
+            truncation=True,
+            return_tensors="pt",
+        )
 
 
 def train_val_split(dataset):

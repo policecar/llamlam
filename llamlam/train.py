@@ -13,15 +13,22 @@ import wandb
 
 from accelerate import Accelerator
 from datasets import load_dataset
-from torch.optim.adamw import AdamW
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 
-from llamlam.config import Config
+from llamlam.checkpoint import CheckpointManager, load_checkpoint, resolve_resume_dir
+from llamlam.config import (
+    MIXED_PRECISION_MODES,
+    MODEL_TYPES,
+    OPTIMIZERS,
+    Config,
+    check_choice,
+)
 from llamlam.data import DataCollator, drop_short_examples, train_val_split
 
 from llamlam.difftransformer import DiffTransformer
-from llamlam.utils import evaluate, get_grouped_params, set_seed
+from llamlam.model import GPTModel
+from llamlam.utils import build_optimizer, evaluate, set_seed
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -33,7 +40,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_RUNS_DIR = Path(__file__).resolve().parent.parent / "data" / "runs"
 
 # CLI options that configure the run itself rather than a Config field
-RUN_OPTIONS = ("debug", "output_dir", "run_name")
+RUN_OPTIONS = ("debug", "output_dir", "run_name", "resume_from")
+
+MODEL_CLASSES = {"diff": DiffTransformer, "gpt": GPTModel}  # keys: config.MODEL_TYPES
 
 
 ##########################################
@@ -83,6 +92,28 @@ def parse_args(argv=None):
         help="Type of learning rate scheduler",
     )
     parser.add_argument("--n_warmup_steps", type=int, help="Number of warmup steps")
+    parser.add_argument(
+        "--model_type", choices=MODEL_TYPES, help="Model architecture (default: diff)"
+    )
+    parser.add_argument(
+        "--optimizer", choices=OPTIMIZERS, help="Optimizer (default: adamw)"
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        choices=MIXED_PRECISION_MODES,
+        help="Mixed-precision mode passed to Accelerator (default: no)",
+    )
+    parser.add_argument(
+        "--keep_k_checkpoints",
+        type=int,
+        help="Number of best (lowest validation loss) checkpoints to keep",
+    )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        help="Resume from a last/ checkpoint directory, or 'latest' for the last/ "
+        "of the run named by --output_dir/--run_name. Resume is epoch-granular",
+    )
     return parser.parse_args(argv)
 
 
@@ -118,10 +149,39 @@ def build_config(args, config=None):
 
 
 def resolve_run_dir(args):
-    """Return (run_name, run_dir) from --run_name / --output_dir."""
+    """
+    Return (run_name, run_dir) from --run_name / --output_dir.
+
+    With --resume_from <checkpoint dir> and neither flag given, the run continues
+    in the directory that holds the checkpoint; given flags always win.
+    """
+    resume_from = getattr(args, "resume_from", None)
+    if resume_from not in (None, "latest") and not (args.run_name or args.output_dir):
+        run_dir = Path(resume_from).resolve().parent
+        return run_dir.name, run_dir
     run_name = args.run_name or f"test_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     parent = Path(args.output_dir) if args.output_dir else DEFAULT_RUNS_DIR
     return run_name, parent / run_name
+
+
+##########################################
+# Model & accelerator
+##########################################
+
+
+def build_model(config):
+    """The model named by config.model_type; raises ValueError for unknown names."""
+    return MODEL_CLASSES[check_choice("model_type", config.model_type, MODEL_TYPES)](
+        config
+    )
+
+
+def build_accelerator(config, **kwargs):
+    """Accelerator with config.mixed_precision; raises ValueError for unknown modes."""
+    mixed_precision = check_choice(
+        "mixed_precision", config.mixed_precision, MIXED_PRECISION_MODES
+    )
+    return Accelerator(mixed_precision=mixed_precision, **kwargs)
 
 
 ##########################################
@@ -186,29 +246,18 @@ def lr_schedule_steps(
 ##########################################
 
 
-class CheckpointTracker:
-    """
-    Saves accelerator state to `<run_dir>/best` whenever validation loss improves
-    on the best seen so far, and to `<run_dir>/last` at the end of each epoch.
-    """
+def count_real_tokens(batch):
+    """Non-padding tokens in a collated batch (all of them without a mask)."""
+    attention_mask = batch.get("attention_mask")
+    if attention_mask is None:
+        return batch["input_ids"].numel()
+    return int(attention_mask.sum().item())
 
-    def __init__(self, accelerator, run_dir):
-        self.accelerator = accelerator
-        self.best_dir = Path(run_dir) / "best"
-        self.last_dir = Path(run_dir) / "last"
-        self.best_val_loss = math.inf
 
-    def update(self, val_loss):
-        """Save to best/ if val_loss beats the best so far; return whether it did."""
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self.accelerator.save_state(self.best_dir)
-            # TODO: keep only the k best checkpoints
-            return True
-        return False
-
-    def save_last(self):
-        self.accelerator.save_state(self.last_dir)
+def sum_over_processes(accelerator, value):
+    """Sum an int over all processes (a collective: every process must call it)."""
+    total = torch.tensor(value, dtype=torch.int64, device=accelerator.device)
+    return int(accelerator.reduce(total, reduction="sum").item())
 
 
 def sample_text(accelerator, model, tokenizer, prompt="Once upon a time"):
@@ -232,31 +281,76 @@ def run_training(
     run_dir,
     tokenizer=None,
     log=None,
+    resume_dir=None,
 ):
     """
-    Train for config.n_epochs. Objects are expected to be accelerator-prepared.
+    Train for config.n_epochs. Objects are expected to be accelerator-prepared,
+    the LR scheduler included.
+
+    After every epoch the state is saved to `run_dir/last`; every evaluation
+    whose loss is among the config.keep_k_checkpoints lowest is kept as
+    `run_dir/ckpt_<global_step>` (see llamlam.checkpoint).
+
+    `resume_dir`, if given, is a last/ checkpoint: model, optimizer, LR scheduler
+    and RNG state and the counters are restored from it and training continues
+    with the epoch after the one it saved. Resume is epoch-granular: an epoch
+    interrupted part-way is trained again from its start. When resuming in the
+    checkpoint's own run directory, the kept-best list carries over.
 
     `log(metrics, step=None)` receives metrics (e.g. wandb.log); `tokenizer`, if
     given, is used to print a sample after each epoch.
 
-    Returns a dict with best_val_loss, n_optimizer_steps and avg_train_loss
-    (of the last epoch).
+    Counters: global_step counts micro-batches trained, tokens_seen non-padding
+    tokens over all processes. Returns a dict with best_val_loss,
+    n_optimizer_steps, global_step, tokens_seen (all over the whole run, resumed
+    part included) and avg_train_loss (of the last epoch trained, nan if none).
     """
     log = log or (lambda *args, **kwargs: None)
     accum = config.gradient_accumulation_steps
     n_micro_batches = len(train_loader)
-    checkpoints = CheckpointTracker(accelerator, run_dir)
+    checkpoints = CheckpointManager(
+        accelerator, run_dir, keep_k=config.keep_k_checkpoints
+    )
 
-    tokens_seen = 0
+    start_epoch = 0
     global_step = 0
     n_optimizer_steps = 0
+    tokens_seen = 0
+    best_val_loss = math.inf
     avg_train_loss = float("nan")
 
-    # TODO: add resumption of training from a checkpoint
-    # https://github.com/huggingface/accelerate/blob/main/examples/complete_nlp_example.py#L175
+    if resume_dir is not None:
+        progress = load_checkpoint(accelerator, resume_dir)
+        start_epoch = progress["epoch"]
+        global_step = progress["global_step"]
+        n_optimizer_steps = progress["n_optimizer_steps"]
+        tokens_seen = progress["tokens_seen"]
+        best_val_loss = progress["best_val_loss"]
+        if Path(resume_dir).resolve().parent == Path(run_dir).resolve():
+            checkpoints.restore(progress)
+        logger.info(
+            f"Resumed from {resume_dir}: starting epoch {start_epoch}, step "
+            f"{global_step}, {n_optimizer_steps} optimizer steps, LR "
+            f"{lr_scheduler.get_last_lr()[0]:.3e}, kept best {checkpoints.best}"
+        )
+        if start_epoch >= config.n_epochs:
+            logger.warning(
+                f"Checkpoint is at epoch {start_epoch}, n_epochs is {config.n_epochs}: "
+                f"nothing left to train"
+            )
 
-    for epoch in range(config.n_epochs):
+    def progress_at(epoch, global_step, tokens_seen):
+        return {
+            "epoch": epoch,
+            "global_step": global_step,
+            "n_optimizer_steps": n_optimizer_steps,
+            "tokens_seen": tokens_seen,
+            "best_val_loss": best_val_loss,
+        }
+
+    for epoch in range(start_epoch, config.n_epochs):
         train_loss = 0.0
+        epoch_tokens = 0  # this process's share, summed over processes when used
         optimizer.zero_grad()  # reset gradients
         for step, batch in enumerate(train_loader):
             model.train()
@@ -278,7 +372,7 @@ def run_training(
                 n_optimizer_steps += 1
 
             train_loss += loss.item()
-            tokens_seen += input_ids.numel()
+            epoch_tokens += count_real_tokens(batch)
             if global_step < 10:  # at the beginning, log some train losses
                 logger.info(f"Epoch {epoch}, step {step}, loss {loss.item()}")
 
@@ -289,7 +383,12 @@ def run_training(
                 logger.info(
                     f"Epoch {epoch} (Step {global_step:06d}): validation loss {val_loss:.3f}"
                 )
-                checkpoints.update(val_loss)
+                best_val_loss = min(best_val_loss, val_loss)
+                # a mid-epoch snapshot, after global_step + 1 micro-batches
+                tokens_now = tokens_seen + sum_over_processes(accelerator, epoch_tokens)
+                checkpoints.save_best(
+                    val_loss, progress_at(epoch, global_step + 1, tokens_now)
+                )
 
             global_step += 1
 
@@ -302,16 +401,26 @@ def run_training(
                 step=global_step,
             )
 
+        tokens_seen += sum_over_processes(accelerator, epoch_tokens)
         avg_train_loss = train_loss / n_micro_batches
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
         logger.info(
             f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
         )
         # log validation loss and metric after each epoch
-        log({"perplexity": perplexity, "val_loss": val_loss, "epoch": epoch})
+        log(
+            {
+                "perplexity": perplexity,
+                "val_loss": val_loss,
+                "tokens_seen": tokens_seen,
+                "epoch": epoch,
+            }
+        )
 
-        checkpoints.update(val_loss)
-        checkpoints.save_last()
+        best_val_loss = min(best_val_loss, val_loss)
+        checkpoints.save_best(val_loss, progress_at(epoch, global_step, tokens_seen))
+        # resumable: a resume starts with the next epoch
+        checkpoints.save_last(progress_at(epoch + 1, global_step, tokens_seen))
 
         # After each epoch, print a sample text
         if tokenizer is not None and accelerator.is_main_process:
@@ -321,8 +430,10 @@ def run_training(
             torch.cuda.empty_cache()
 
     return {
-        "best_val_loss": checkpoints.best_val_loss,
+        "best_val_loss": best_val_loss,
         "n_optimizer_steps": n_optimizer_steps,
+        "global_step": global_step,
+        "tokens_seen": tokens_seen,
         "avg_train_loss": avg_train_loss,
     }
 
@@ -337,16 +448,19 @@ def main(argv=None):
     config = build_config(args)
     logger.info(f"Arguments parsed: {vars(args)}")
 
-    # Create run directory
+    # Resolve the run and resume directories (raises before anything is created)
     run_name, output_dir = resolve_run_dir(args)
+    resume_dir = resolve_resume_dir(output_dir, args.resume_from)
     os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Run directory created at: {output_dir}")
+    logger.info(f"Run directory: {output_dir}")
+    if resume_dir is not None:
+        logger.info(f"Resuming from: {resume_dir}")
 
     # Set seed
     set_seed(seed=config.seed)
     logger.info(f"Using seed: {config.seed}")
 
-    accelerator = Accelerator()
+    accelerator = build_accelerator(config)
 
     ##########################################
     # Initialize tokenizer & some
@@ -431,20 +545,18 @@ def main(argv=None):
     # Instantiate model
     ##########################################
 
-    model = DiffTransformer(config)
-    # model = GPTModel(config)
+    model = build_model(config)
+    logger.info(f"Model: {type(model).__name__} (model_type={config.model_type})")
 
     ##########################################
     # Define optimizer
     ##########################################
 
-    optimizer = AdamW(
-        get_grouped_params(model, weight_decay=config.weight_decay),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(model, config)
 
-    logger.info(f"Optimizer initialized with config: {config}")
+    logger.info(
+        f"Optimizer {type(optimizer).__name__} initialized with config: {config}"
+    )
 
     ##########################################
     # Prepare, then build the LR scheduler
@@ -485,6 +597,8 @@ def main(argv=None):
     # Training loop
     ##########################################
 
+    # The scheduler is prepared above, so resuming (accelerator.load_state inside
+    # run_training) restores its position along with the model and optimizer
     run_training(
         model,
         optimizer,
@@ -496,6 +610,7 @@ def main(argv=None):
         output_dir,
         tokenizer=tokenizer,
         log=wandb.log,
+        resume_dir=resume_dir,
     )
 
     accelerator.end_training()
