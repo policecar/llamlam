@@ -2,22 +2,25 @@
 Up-and-coming optimizers:
 
 - GrokAdamW from https://github.com/cognitivecomputations/grokadamw
-- Muon from https://github.com/KellerJordan/Muon/
+- Muon from https://github.com/KellerJordan/Muon/ (the Nov-2024 version with the
+  built-in AdamW backup, commit d7ee0fe; fixes follow upstream's later 28c793b)
 
+@decision DEC-OPT-001: Optimizer state is created lazily, on each parameter's device.
+@rationale: Matches torch.optim; eager CUDA allocation broke CPU/MPS, add_param_group
+    and load_state_dict, and allocated state for parameters that never get gradients.
+@decision DEC-OPT-002: Parameters whose .grad is None are skipped (no state, no weight
+    decay), as in torch.optim and upstream Muon 28c793b.
+@rationale: Unused parameters (e.g. frozen or conditionally used modules) must not
+    move. In distributed Muon the owner's slot stays zero, so all ranks agree.
 """
 
+import math
 import os
+from typing import Callable, Iterable, Optional
+
 import torch
-
 import torch.distributed as dist
-
 from torch.optim.optimizer import Optimizer
-from torch.cuda.amp import autocast
-from typing import Iterable, Callable, Optional
-import logging
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
 class GrokAdamW(Optimizer):
@@ -47,6 +50,16 @@ class GrokAdamW(Optimizer):
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         if not 0.0 <= alpha_init <= 1.0:
             raise ValueError(f"Invalid alpha_init value: {alpha_init}")
+        if not 0.0 <= lamb:
+            raise ValueError(f"Invalid lamb value: {lamb}")
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f"Invalid gamma value: {gamma}")
+        if not 0.0 <= grokking_signal_decay_rate:
+            raise ValueError(
+                f"Invalid grokking_signal_decay_rate value: {grokking_signal_decay_rate}"
+            )
+        if not 0.0 <= gradient_clipping:
+            raise ValueError(f"Invalid gradient_clipping value: {gradient_clipping}")
 
         defaults = dict(
             lr=lr,
@@ -60,28 +73,7 @@ class GrokAdamW(Optimizer):
             grokking_signal_decay_rate=grokking_signal_decay_rate,
             gradient_clipping=gradient_clipping,
         )
-        super(GrokAdamW, self).__init__(params, defaults)
-
-        # Pre-allocate state tensors and move to CUDA if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for group in self.param_groups:
-            for p in group["params"]:
-                state = self.state[p] = {}
-                state["step"] = 0
-                state["exp_avg"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-                state["exp_avg_sq"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-                state["grok_ema"] = torch.empty_like(
-                    p, memory_format=torch.preserve_format
-                ).to(device)
-
-                # Initialize tensors
-                state["exp_avg"].zero_()
-                state["exp_avg_sq"].zero_()
-                state["grok_ema"].zero_()
+        super().__init__(params, defaults)
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -101,7 +93,9 @@ class GrokAdamW(Optimizer):
         Args:
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
-            use_amp (bool): Whether to use automatic mixed precision (AMP).
+            use_amp (bool): Run the update under torch.autocast for the parameters'
+                device type. The update is in-place elementwise math, which autocast
+                does not recast, so this matches step().
 
         Returns:
             Optional[float]: The loss value returned by the closure, if provided.
@@ -114,78 +108,94 @@ class GrokAdamW(Optimizer):
         for group in self.param_groups:
             grokking_signal = self._compute_grokking_signal(group)
 
-            params_with_grad = [p for p in group["params"] if p.grad is not None]
-            if not params_with_grad:
+            # Keep each parameter's index in the group: layer-wise beta1 decay is by
+            # position and must not shift when an earlier parameter has no grad.
+            indexed = [
+                (i, p) for i, p in enumerate(group["params"]) if p.grad is not None
+            ]
+            if not indexed:
                 continue
 
-            grads = [p.grad for p in params_with_grad]
-
-            # Function to apply parameter updates
-            def _apply_updates():
-                self._update_group(group, params_with_grad, grads, grokking_signal)
-
             if use_amp:
-                with autocast():
-                    _apply_updates()
+                with torch.autocast(device_type=indexed[0][1].device.type):
+                    self._update_group(group, indexed, grokking_signal)
             else:
-                _apply_updates()
+                self._update_group(group, indexed, grokking_signal)
 
         return loss
 
     def _compute_grokking_signal(self, group: dict) -> Optional[float]:
-        """Computes a combined grokking signal from multiple functions."""
+        """Mean of the signals returned by grokking_signal_fns, ignoring None.
+
+        Exceptions raised by a signal function propagate: a broken signal is a
+        misconfiguration and must not silently turn Grokfast amplification off.
+        """
         if group["grokking_signal_fns"] is None:
             return None
 
-        signals = []
-        for fn in group["grokking_signal_fns"]:
-            try:
-                signal = fn()
-                if signal is not None:
-                    signals.append(signal)
-            except Exception as e:
-                logger.warning(
-                    f"Error in grokking_signal_fn: {e}. Ignoring this function."
-                )
-
+        signals = [
+            s for s in (fn() for fn in group["grokking_signal_fns"]) if s is not None
+        ]
         if not signals:
             return None
-
-        # Example: Taking the mean of all valid signals
         return sum(signals) / len(signals)
 
-    @staticmethod
     def _update_group(
+        self,
         group: dict,
-        params: list[torch.Tensor],
-        grads: list[torch.Tensor],
+        indexed_params: list[tuple[int, torch.Tensor]],
         grokking_signal: Optional[float],
     ) -> None:
-        for i, (p, grad) in enumerate(zip(params, grads)):
-            state = group["state"][p]
+        beta1, beta2 = group["betas"]
+        alpha = group["alpha_init"]
+        if grokking_signal is not None:
+            alpha = alpha * math.exp(
+                -group["grokking_signal_decay_rate"] * grokking_signal
+            )
+            if not 0.0 <= alpha <= 1.0:
+                raise ValueError(
+                    f"Grokking signal {grokking_signal} gives EMA alpha {alpha} outside "
+                    "[0, 1]; signals must be non-negative."
+                )
+
+        for i, p in indexed_params:
+            state = self.state[p]
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
+                state["grok_ema"] = torch.zeros_like(
+                    p, memory_format=torch.preserve_format
+                )
             exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-            beta1, beta2 = group["betas"]
 
             state["step"] += 1
 
-            # Apply gradient clipping if enabled
+            # Per-tensor gradient clipping (upstream behaviour; modifies p.grad in place)
             if group["gradient_clipping"] > 0:
                 torch.nn.utils.clip_grad_norm_(p, group["gradient_clipping"])
+            grad = p.grad
 
             # Layer-wise momentum decay
             layer_beta1 = beta1 * (1 - group["gamma"]) ** i
 
             # Grokfast component
-            grok_grad = GrokAdamW._update_grok_ema(grad, state, group, grokking_signal)
+            grok_ema = state["grok_ema"]
+            grok_ema.mul_(alpha).add_(grad, alpha=1 - alpha)
+            grok_grad = grad + group["lamb"] * grok_ema
 
             # AdamW update with Grokfast-amplified gradient
             exp_avg.mul_(layer_beta1).add_(grok_grad, alpha=1 - layer_beta1)
             exp_avg_sq.mul_(beta2).addcmul_(grok_grad, grok_grad, value=1 - beta2)
 
-            # AdamW bias correction
-            bias_correction1 = 1 - beta1 ** state["step"]
+            # Bias correction must use the beta1 that exp_avg was accumulated with
+            bias_correction1 = 1 - layer_beta1 ** state["step"]
             bias_correction2 = 1 - beta2 ** state["step"]
-            step_size = group["lr"] * torch.sqrt(bias_correction2) / bias_correction1
+            step_size = group["lr"] * math.sqrt(bias_correction2) / bias_correction1
 
             # Decoupled weight decay (from AdamW)
             p.mul_(1 - group["lr"] * group["weight_decay"])
@@ -193,21 +203,7 @@ class GrokAdamW(Optimizer):
             # Update parameters
             p.addcdiv_(exp_avg, exp_avg_sq.sqrt().add_(group["eps"]), value=-step_size)
 
-    @staticmethod
-    def _update_grok_ema(
-        grad: torch.Tensor, state: dict, group: dict, grokking_signal: Optional[float]
-    ) -> torch.Tensor:
-        grok_ema = state["grok_ema"]
-        alpha = group["alpha_init"]
-        if grokking_signal is not None:
-            alpha = alpha * torch.exp(
-                -group["grokking_signal_decay_rate"] * grokking_signal
-            )
-        grok_ema.mul_(alpha).add_(grad, alpha=1 - alpha)
-        return grad + group["lamb"] * grok_ema
 
-
-@torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -215,13 +211,17 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
     of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
     zero even beyond the point where the iteration no longer converges all the way to one everywhere
     on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
+    where S' is diagonal with S_{ii}' \\sim Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
+
+    Runs in bfloat16 on every device (as upstream). Not wrapped in torch.compile so it
+    works without a compiler toolchain; callers may compile it themselves.
     """
-    assert len(G.shape) == 2
+    if G.ndim != 2:
+        raise ValueError(f"Expected a 2-D tensor, got shape {tuple(G.shape)}")
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    X /= X.norm() + eps  # ensure top singular value <= 1
+    X = X / (X.norm() + eps)  # ensure top singular value <= 1; never mutates G
     if G.size(0) > G.size(1):
         X = X.T
     for _ in range(steps):
@@ -258,6 +258,9 @@ class Muon(torch.optim.Optimizer):
         adamw_betas: The betas for the internal AdamW.
         adamw_eps: The epsilon for the internal AdamW.
         adamw_wd: The weight decay for the internal AdamW.
+
+    Distributed: if WORLD_SIZE is set, each rank orthogonalizes every WORLD_SIZE-th Muon
+    parameter and the updates are summed with dist.all_reduce (process group must exist).
     """
 
     def __init__(
@@ -273,6 +276,13 @@ class Muon(torch.optim.Optimizer):
         adamw_eps=1e-8,
         adamw_wd=0,
     ):
+        if not lr > 0.0:
+            # adamw lr is stored as a ratio of lr so that lr schedulers scale both
+            raise ValueError(f"Invalid learning rate: {lr} (must be > 0)")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Invalid momentum value: {momentum}")
+        if not ns_steps >= 1:
+            raise ValueError(f"Invalid ns_steps value: {ns_steps}")
         defaults = dict(
             lr=lr,
             momentum=momentum,
@@ -284,10 +294,13 @@ class Muon(torch.optim.Optimizer):
             adamw_wd=adamw_wd,
         )
 
-        params = list(muon_params)
+        # Materialize first: both arguments may be one-shot iterators (model.parameters()).
+        muon_params = list(muon_params)
         adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
-        super().__init__(params, defaults)
+        muon_ids = {id(p) for p in muon_params}
+        if any(id(p) in muon_ids for p in adamw_params):
+            raise ValueError("A parameter is in both muon_params and adamw_params")
+        super().__init__(muon_params + adamw_params, defaults)
 
         # Sort parameters into those for which we will use Muon, and those for which we will not
         for p in muon_params:
@@ -307,7 +320,19 @@ class Muon(torch.optim.Optimizer):
             self.world_size = 1
             self.rank = 0
 
-    def step(self):
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform a single optimization step.
+
+        Args:
+            closure (Callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
         for group in self.param_groups:
             ############################
             #           Muon           #
@@ -317,45 +342,48 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
 
-            # generate weight updates in distributed fashion
-            total_params = sum(p.numel() for p in params)
-            updates_flat = torch.zeros(
-                total_params, device="cuda", dtype=torch.bfloat16
-            )
-            curr_idx = 0
-            for i, p in enumerate(params):
-                # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                if i % self.world_size == self.rank:
-                    g = p.grad
-                    if g.ndim > 2:
-                        g = g.view(g.size(0), -1)
-                    assert g is not None
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if group["nesterov"]:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr_idx : curr_idx + p.numel()] = g.flatten()
-                curr_idx += p.numel()
-
-            # sync updates across devices. we are not memory-constrained so can do this simple deserialization
-            if self.world_size > 1:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            # deserialize and apply updates
-            curr_idx = 0
-            for p in params:
-                g = (
-                    updates_flat[curr_idx : curr_idx + p.numel()]
-                    .view_as(p.data)
-                    .type_as(p.data)
+            if params:
+                # generate weight updates in distributed fashion
+                total_params = sum(p.numel() for p in params)
+                updates_flat = torch.zeros(
+                    total_params, device=params[0].device, dtype=torch.bfloat16
                 )
-                p.data.add_(g, alpha=-lr)
-                curr_idx += p.numel()
+                curr_idx = 0
+                for i, p in enumerate(params):
+                    # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
+                    if i % self.world_size == self.rank and p.grad is not None:
+                        g = p.grad
+                        if g.ndim > 2:
+                            g = g.view(g.size(0), -1)
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf = state["momentum_buffer"]
+                        buf.mul_(momentum).add_(g)
+                        if group["nesterov"]:
+                            g = g.add(buf, alpha=momentum)
+                        else:
+                            g = buf
+                        g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                        updates_flat[curr_idx : curr_idx + p.numel()] = g.flatten()
+                    curr_idx += p.numel()
+
+                # sync updates across devices. we are not memory-constrained so can do this simple deserialization
+                if self.world_size > 1:
+                    dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+                # deserialize and apply updates. Applied to every param regardless of the
+                # local .grad: the owning rank decided, and a skipped param's slot is zero.
+                curr_idx = 0
+                for p in params:
+                    g = (
+                        updates_flat[curr_idx : curr_idx + p.numel()]
+                        .view_as(p)
+                        .type_as(p)
+                    )
+                    p.add_(g, alpha=-lr)
+                    curr_idx += p.numel()
 
             ############################
             #       AdamW backup       #
@@ -371,7 +399,8 @@ class Muon(torch.optim.Optimizer):
 
             for p in params:
                 g = p.grad
-                assert g is not None
+                if g is None:
+                    continue
                 state = self.state[p]
                 if "step" not in state:
                     state["step"] = 0
@@ -389,5 +418,7 @@ class Muon(torch.optim.Optimizer):
                 bias_correction1 = 1 - beta1**step
                 bias_correction2 = 1 - beta2**step
                 scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
+                p.mul_(1 - lr * weight_decay)
+                p.add_(g, alpha=-lr / scale)
+
+        return loss
