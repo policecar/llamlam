@@ -1,10 +1,52 @@
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.init as init
 from torch.nn import functional as F
 
 from llamlam.activation import GELU
+
+
+def causal_lm_loss(loss_fn, logits, input_ids, attention_mask=None):
+    """
+    Next-token prediction loss shared by GPTModel and DiffTransformer.
+
+    @decision DEC-001: Padding is excluded from the loss by setting masked target
+    labels to `loss_fn.ignore_index`; logits are never touched.
+    @rationale: Attention is causal, so right-padding cannot influence real
+    positions; only the loss average was polluted. Masking labels keeps the
+    `attention_mask=None` path bit-identical and lets both models share one
+    contract (1 = real token, 0 = padding; a target is dropped iff its own mask
+    entry is 0).
+
+    Args:
+        loss_fn: nn.CrossEntropyLoss (its ignore_index marks dropped targets)
+        logits: [B, L, V]
+        input_ids: [B, L]
+        attention_mask: optional [B, L], 1 = real token, 0 = padding
+
+    Raises:
+        ValueError: if attention_mask has the wrong shape, or masks every target.
+    """
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = input_ids[..., 1:].contiguous()
+
+    if attention_mask is not None:
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                f"attention_mask shape {tuple(attention_mask.shape)} does not match "
+                f"input_ids shape {tuple(input_ids.shape)}"
+            )
+        target_is_real = attention_mask[..., 1:].bool()
+        if not target_is_real.any():
+            raise ValueError(
+                "attention_mask masks every target position; the loss would be NaN"
+            )
+        shift_labels = shift_labels.masked_fill(~target_is_real, loss_fn.ignore_index)
+
+    return loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
 
 class LayerNorm(nn.Module):
@@ -91,9 +133,9 @@ class Block(nn.Module):
         self.context = Context(config.dim_embd, config.n_heads)
 
         self.feedforward = nn.Sequential(
-            nn.Linear(config.dim_embd, 4 * config.dim_embd),
+            nn.Linear(config.dim_embd, 4 * config.dim_embd, bias=config.bias),
             GELU(),
-            nn.Linear(4 * config.dim_embd, config.dim_embd),
+            nn.Linear(4 * config.dim_embd, config.dim_embd, bias=config.bias),
         )
         for name, param in self.feedforward.named_parameters():
             if "weight" in name:
@@ -131,7 +173,7 @@ class GPTModel(nn.Module):
             torch.zeros(1, config.max_seq_length, config.dim_embd)
         )
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layers)])
-        self.ln_f = nn.LayerNorm(config.dim_embd)
+        self.ln_f = nn.LayerNorm(config.dim_embd, bias=config.bias)
         self.head = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
         self.loss_fn = nn.CrossEntropyLoss()
         self.bias = config.bias
@@ -161,13 +203,9 @@ class GPTModel(nn.Module):
         outputs = {"logits": logits}
 
         if input_ids is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = input_ids[..., 1:].contiguous()
-
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            outputs["loss"] = causal_lm_loss(
+                self.loss_fn, logits, input_ids, attention_mask
             )
-            outputs["loss"] = loss
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states
@@ -175,6 +213,7 @@ class GPTModel(nn.Module):
         return outputs
 
     def save_pretrained(self, output_dir, tag, optimizer=None):
+        output_dir = Path(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         torch.save(self.state_dict(), output_dir / f"model_{tag}.pt")
         if optimizer is not None:

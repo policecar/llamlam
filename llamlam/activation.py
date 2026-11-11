@@ -39,11 +39,15 @@ class SwiGLU(nn.Module):
             d_model (int): Dimension of the input features.
         """
         super().__init__()
+        # Hidden size 8/3 * d_model (Diff Transformer paper, after LLaMA): three
+        # d_model x hidden matrices then hold ~8 * d_model^2 weights, the same as
+        # a GELU MLP with hidden 4 * d_model.
+        hidden = int(8 * d_model / 3)
         # Intermediate projection layers
         # Typically, SwiGLU splits the computation into two parts
-        self.WG = nn.Linear(d_model, d_model * 2)
-        self.W1 = nn.Linear(d_model, d_model * 2)
-        self.W2 = nn.Linear(d_model * 2, d_model)
+        self.WG = nn.Linear(d_model, hidden)
+        self.W1 = nn.Linear(d_model, hidden)
+        self.W2 = nn.Linear(hidden, d_model)
 
     def forward(self, x):
         """

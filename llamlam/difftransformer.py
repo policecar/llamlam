@@ -6,12 +6,15 @@ Original code: https://github.com/microsoft/unilm/blob/master/Diff-Transformer/m
 """
 
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 from .activation import SwiGLU
+from .model import causal_lm_loss
 
 
 class RMSNorm(nn.Module):
@@ -54,28 +57,45 @@ class MultiHeadDifferentialAttention(nn.Module):
     def __init__(self, dim_embd, n_heads, lambda_init):
         """
         Args:
-            dim_embd (int): Dimension of the model. Must be divisible by n_heads.
-            n_heads (int): Number of attention heads.
+            dim_embd (int): Dimension of the model. Must be divisible by 2 * n_heads.
+            n_heads (int): Number of differential heads; each is a pair of softmax
+                maps over head_dim = dim_embd // n_heads // 2.
             lambda_init (float): Initial value for lambda.
+
+        @decision DEC-001: Reference (unilm multihead_diffattn.py) projection layout:
+        Q, K, V and output are all dim_embd -> dim_embd; Q/K hold 2 * n_heads
+        components of head_dim, V holds n_heads values of 2 * head_dim.
+        @rationale: Projecting to 2 * dim_embd doubled the attention weights
+        (8 d^2 vs GPT's 4 d^2); this layout makes the layer parameter-matched.
         """
         super().__init__()
-        assert dim_embd % n_heads == 0, "dim_embd must be divisible by n_heads"
+        if dim_embd % (2 * n_heads) != 0:
+            raise ValueError(
+                f"dim_embd ({dim_embd}) must be divisible by 2 * n_heads "
+                f"({2 * n_heads}) for differential attention"
+            )
 
         self.n_heads = n_heads
-        self.dim_head = dim_embd // n_heads
+        self.dim_head = dim_embd // n_heads // 2
 
-        # Linear projections for queries, keys, and values
-        # Project to 2 * d_head per head for differential attention
-        self.W_q = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_k = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_v = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_o = nn.Linear(2 * self.dim_head * n_heads, dim_embd, bias=False)
+        # Linear projections for queries, keys, and values.
+        # Viewed per head as 2 * dim_head: Q/K split into (Q1, Q2)/(K1, K2) of
+        # dim_head each; V stays whole (2 * dim_head) per head.
+        self.W_q = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_k = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_v = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_o = nn.Linear(dim_embd, dim_embd, bias=False)
 
-        # Learnable parameters for lambda reparameterization
-        self.lambda_q1 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_k1 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_q2 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_k2 = nn.Parameter(torch.randn(n_heads, self.dim_head))
+        # Learnable parameters for lambda reparameterization.
+        # std 0.1 as in the paper/reference, so lambda ~= lambda_init at init
+        # (std 1 made exp(q . k) range into the thousands for dim_head = 64).
+        def _lambda_param():
+            return nn.Parameter(torch.zeros(n_heads, self.dim_head).normal_(0, 0.1))
+
+        self.lambda_q1 = _lambda_param()
+        self.lambda_k1 = _lambda_param()
+        self.lambda_q2 = _lambda_param()
+        self.lambda_k2 = _lambda_param()
 
         self.lambda_init = lambda_init
 
@@ -95,6 +115,19 @@ class MultiHeadDifferentialAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_v.weight)
         nn.init.xavier_uniform_(self.W_o.weight)
         nn.init.constant_(self.rms_scale, 1.0)
+
+    def lambda_full(self):
+        """
+        lambda = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
+
+        Returns:
+            Tensor: shape (n_heads,)
+        """
+        lambda_q1_dot_k1 = torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()
+        lambda_q2_dot_k2 = torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()
+        return (
+            torch.exp(lambda_q1_dot_k1) - torch.exp(lambda_q2_dot_k2) + self.lambda_init
+        )
 
     def forward(self, X):
         """
@@ -123,19 +156,8 @@ class MultiHeadDifferentialAttention(nn.Module):
         Q1, Q2 = Q.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
         K1, K2 = K.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
 
-        # Compute lambda using reparameterization
-        # lambda_val = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
-        # Compute dot products for each head
-        # Shape of lambda_val: (n_heads,)
-        lambda_q1_dot_k1 = torch.sum(
-            self.lambda_q1 * self.lambda_k1, dim=-1
-        ).float()  # (n_heads,)
-        lambda_q2_dot_k2 = torch.sum(
-            self.lambda_q2 * self.lambda_k2, dim=-1
-        ).float()  # (n_heads,)
-        lambda_val = (
-            torch.exp(lambda_q1_dot_k1) - torch.exp(lambda_q2_dot_k2) + self.lambda_init
-        )  # (n_heads,)
+        # Compute lambda using reparameterization, shape (n_heads,)
+        lambda_val = self.lambda_full()
 
         # Expand lambda_val to match attention dimensions
         # Shape: (batch, n_heads, 1, 1)
@@ -208,18 +230,20 @@ class DiffTransformerLayer(nn.Module):
     Consists of Multi-Head Differential Attention followed by a SwiGLU Feed-Forward Network.
     """
 
-    def __init__(self, dim_embd, n_heads, lambda_init):
+    def __init__(self, dim_embd, n_heads, lambda_init, dropout=0.0):
         """
         Args:
             dim_embd (int): Dimension of the model.
             n_heads (int): Number of attention heads.
             lambda_init (float): Initial value for lambda in Differential Attention.
+            dropout (float): Residual dropout rate (as in GPT's Block).
         """
         super().__init__()
         self.norm1 = RMSNorm(dim_embd)
         self.attn = MultiHeadDifferentialAttention(dim_embd, n_heads, lambda_init)
         self.norm2 = RMSNorm(dim_embd)
         self.ff = SwiGLU(dim_embd)
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x):
         """
@@ -232,9 +256,9 @@ class DiffTransformerLayer(nn.Module):
             Tensor: Output tensor after processing through the layer.
         """
         # Apply Multi-Head Differential Attention with residual connection
-        y = self.attn(self.norm1(x)) + x
+        y = self.dropout(self.attn(self.norm1(x))) + x
         # Apply SwiGLU Feed-Forward Network with residual connection
-        z = self.ff(self.norm2(y)) + y
+        z = self.dropout(self.ff(self.norm2(y))) + y
         return z
 
 
@@ -254,10 +278,7 @@ class DiffTransformer(nn.Module):
         self.config = config
         self.loss_fn = nn.CrossEntropyLoss()
 
-        assert (
-            self.config.dim_embd % self.config.n_heads == 0
-        ), "dim_embd must be divisible by n_heads"
-
+        # dim_embd % (2 * n_heads) is checked in MultiHeadDifferentialAttention
         self.token_emb = nn.Embedding(self.config.vocab_size, self.config.dim_embd)
         self.pos_emb = nn.Embedding(self.config.max_seq_length, self.config.dim_embd)
         self.layers = nn.ModuleList(
@@ -267,6 +288,7 @@ class DiffTransformer(nn.Module):
                     n_heads=self.config.n_heads,
                     lambda_init=0.8
                     - 0.6 * math.exp(-0.3 * (l - 1)),  # Decaying lambda_init
+                    dropout=self.config.dropout,
                 )
                 for l in range(1, self.config.n_layers + 1)  # noqa: E741
             ]
@@ -291,9 +313,13 @@ class DiffTransformer(nn.Module):
 
         Args:
             x (Tensor): Input tensor of token indices of shape (batch, sequence_length).
+            attention_mask (Tensor, optional): (batch, sequence_length), 1 = real
+                token, 0 = padding. Padded targets are excluded from the loss;
+                logits are unaffected.
 
         Returns:
-            Tensor: Logits for each token in the vocabulary of shape (batch, sequence_length, vocab_size).
+            dict: "logits" (batch, sequence_length, vocab_size), "loss", and
+            optionally "hidden_states".
         """
         batch, N = x.shape
         positions = (
@@ -315,15 +341,7 @@ class DiffTransformer(nn.Module):
 
         # Calculate loss if input tokens provided
         if x is not None:
-            # Shift logits and labels for next-token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = x[..., 1:].contiguous()
-
-            # Calculate cross entropy loss
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            outputs["loss"] = loss
+            outputs["loss"] = causal_lm_loss(self.loss_fn, logits, x, attention_mask)
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states
@@ -331,6 +349,7 @@ class DiffTransformer(nn.Module):
         return outputs
 
     def save_pretrained(self, output_dir, tag, optimizer=None):
+        output_dir = Path(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         torch.save(self.state_dict(), output_dir / f"model_{tag}.pt")
         if optimizer is not None:
@@ -409,8 +428,8 @@ if __name__ == "__main__":
     # Define model hyperparameters
     config = Config(
         vocab_size=30522,
-        dim_embd=768,
         n_heads=12,
+        dim_head=64,  # dim_embd = n_heads * dim_head = 768
         n_layers=12,
         max_seq_length=512,
     )
@@ -430,5 +449,8 @@ if __name__ == "__main__":
     )  # (batch, N)
 
     # Forward pass
-    logits = model(input_ids)  # (batch, N, vocab_size)
-    print(logits.shape)  # Should output: torch.Size([2, 128, 30522])
+    model.eval()
+    with torch.no_grad():
+        outputs = model(input_ids)
+    print(outputs["logits"].shape)  # Should output: torch.Size([2, 128, 30522])
+    print(f"loss: {outputs['loss'].item():.4f}")
