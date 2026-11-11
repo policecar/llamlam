@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 
 from llamlam.config import Config
-from llamlam.data import DataCollator, train_val_split
+from llamlam.data import DataCollator, drop_short_examples, train_val_split
 
 from llamlam.difftransformer import DiffTransformer
 from llamlam.utils import evaluate, get_grouped_params, set_seed
@@ -149,6 +149,36 @@ def accumulation_group_size(step, n_micro_batches, accum):
 def num_training_steps(n_epochs, n_micro_batches, accum):
     """Optimizer steps taken over training (each epoch flushes a partial group)."""
     return n_epochs * math.ceil(n_micro_batches / accum)
+
+
+# @decision DEC-002: build the LR scheduler after accelerator.prepare, from the
+#   sharded train loader's length, with warmup and total multiplied by
+#   num_processes (unless split_batches)
+# @rationale: accelerate 1.0.1's AcceleratedScheduler.step (scheduler.py) advances
+#   the wrapped scheduler num_processes times per call when split_batches is False,
+#   and once when it is True. Each process takes num_training_steps(...) optimizer
+#   steps over its own shard, so scaling both counts by that factor makes the
+#   schedule, measured in optimizer steps, identical to the single-process one and
+#   ends it exactly on the last optimizer step. Assumes step_scheduler_with_optimizer
+#   (the Accelerator default) and no accelerator.accumulate (sync_gradients stays
+#   True, so every step() call advances the schedule).
+
+
+def lr_schedule_steps(
+    n_epochs, n_micro_batches, accum, n_warmup_steps, num_processes, split_batches
+):
+    """
+    (num_warmup_steps, num_training_steps) to pass to get_scheduler so that, once
+    wrapped by accelerator.prepare, the schedule warms up over n_warmup_steps
+    optimizer steps and ends on the last one.
+
+    n_micro_batches is the length of the *prepared* (per-process) train loader.
+    """
+    if num_processes < 1:
+        raise ValueError(f"num_processes must be >= 1, got {num_processes}")
+    steps_per_call = 1 if split_batches else num_processes
+    n_optimizer_steps = num_training_steps(n_epochs, n_micro_batches, accum)
+    return n_warmup_steps * steps_per_call, n_optimizer_steps * steps_per_call
 
 
 ##########################################
@@ -367,6 +397,16 @@ def main(argv=None):
     train_set = train_set.select_columns(["text"])
     val_set = val_set.select_columns(["text"])
 
+    # Drop examples without a next-token target (< 2 tokens); the main process
+    # writes the datasets cache first, the others then reuse it
+    with accelerator.main_process_first():
+        train_set = drop_short_examples(
+            train_set, tokenizer, config.max_seq_length, name="train"
+        )
+        val_set = drop_short_examples(
+            val_set, tokenizer, config.max_seq_length, name="validation"
+        )
+
     # Define collate function
     collate_fn = DataCollator(tokenizer, config)
 
@@ -404,24 +444,46 @@ def main(argv=None):
         weight_decay=config.weight_decay,
     )
 
+    logger.info(f"Optimizer initialized with config: {config}")
+
+    ##########################################
+    # Prepare, then build the LR scheduler
+    ##########################################
+
+    # ~"no specific order, we just need to unpack objects in the same order we gave them to the prepare method"
+    base_optimizer = optimizer
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
+    )
+
+    # Counts come from the sharded loader; see lr_schedule_steps
+    accum = config.gradient_accumulation_steps
+    n_warmup_steps, n_scheduler_steps = lr_schedule_steps(
+        config.n_epochs,
+        len(train_loader),
+        accum,
+        config.n_warmup_steps,
+        accelerator.num_processes,
+        accelerator.split_batches,
+    )
     lr_scheduler = get_scheduler(
         name=config.lr_scheduler_type,
-        optimizer=optimizer,
-        num_warmup_steps=config.n_warmup_steps,
-        num_training_steps=num_training_steps(
-            config.n_epochs, len(train_loader), config.gradient_accumulation_steps
-        ),
+        optimizer=base_optimizer,  # prepare_scheduler matches it to its wrapper
+        num_warmup_steps=n_warmup_steps,
+        num_training_steps=n_scheduler_steps,
     )
-    logger.info(f"Optimizer initialized with config: {config}")
+    lr_scheduler = accelerator.prepare(lr_scheduler)
+    n_optimizer_steps = num_training_steps(config.n_epochs, len(train_loader), accum)
+    logger.info(
+        f"LR scheduler: {len(train_loader)} micro-batches per process per epoch, "
+        f"{n_optimizer_steps} optimizer steps, scheduler warmup/total "
+        f"{n_warmup_steps}/{n_scheduler_steps} over {accelerator.num_processes} "
+        f"process(es)"
+    )
 
     ##########################################
     # Training loop
     ##########################################
-
-    # ~"no specific order, we just need to unpack objects in the same order we gave them to the prepare method"
-    model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, lr_scheduler
-    )
 
     run_training(
         model,

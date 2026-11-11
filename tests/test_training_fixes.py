@@ -6,14 +6,20 @@ best/last checkpoints (5), weight-decay groups (7), sampling via unwrap (10).
 
 import copy
 import math
+from types import SimpleNamespace
 
+import accelerate.scheduler
 import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate import Accelerator
+from accelerate.optimizer import AcceleratedOptimizer
+from accelerate.scheduler import AcceleratedScheduler
 from safetensors.torch import load_file
 from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.data import DataLoader
+from transformers import get_scheduler
 
 from llamlam.config import Config
 from llamlam.difftransformer import DiffTransformer
@@ -22,6 +28,7 @@ from llamlam.train import (
     CheckpointTracker,
     accumulation_group_size,
     is_accumulation_boundary,
+    lr_schedule_steps,
     num_training_steps,
     run_training,
     sample_text,
@@ -478,3 +485,143 @@ def test_sample_text_unwraps_model():
     assert not hasattr(wrapped, "generate")  # the old direct call would fail
     text = sample_text(Accelerator(cpu=True), wrapped, tokenizer, prompt="Once upon")
     assert isinstance(text, str) and text.startswith("Once upon")
+
+
+##########################################
+# LR scheduler step counts with several processes
+##########################################
+
+
+def test_lr_schedule_steps():
+    # single process: unchanged from the optimizer-step count
+    assert lr_schedule_steps(2, 10, 4, 3, 1, False) == (3, num_training_steps(2, 10, 4))
+    # each step() call advances the wrapped scheduler num_processes times
+    # (2 epochs * ceil(5 / 4) = 4 optimizer steps) * 2 processes
+    assert lr_schedule_steps(2, 5, 4, 3, 2, False) == (6, 8)
+    assert lr_schedule_steps(1, 7, 2, 2, 3, False) == (6, 12)
+    # split_batches: one advance per call
+    assert lr_schedule_steps(2, 5, 4, 3, 2, True) == (3, 4)
+    with pytest.raises(ValueError, match="num_processes"):
+        lr_schedule_steps(1, 4, 1, 0, 0, False)
+
+
+def lrs_per_optimizer_step(
+    accelerator,
+    monkeypatch,
+    scheduler_type,
+    n_epochs,
+    n_micro_batches,
+    accum,
+    counts,
+    P,
+):
+    """
+    LR after each optimizer step of one process, stepping a real
+    AcceleratedScheduler at the run_training accumulation boundaries while it
+    believes there are P processes. Returns (lrs, underlying scheduler).
+    """
+    monkeypatch.setattr(
+        accelerate.scheduler,
+        "AcceleratorState",
+        lambda: SimpleNamespace(num_processes=P),
+    )
+    optimizer = torch.optim.SGD([nn.Parameter(torch.zeros(1))], lr=1.0)
+    scheduler = get_scheduler(
+        scheduler_type,
+        optimizer,
+        num_warmup_steps=counts[0],
+        num_training_steps=counts[1],
+    )
+    accelerated_optimizer = AcceleratedOptimizer(optimizer, device_placement=False)
+    wrapped = AcceleratedScheduler(scheduler, accelerated_optimizer)
+    assert not wrapped.split_batches and wrapped.step_with_optimizer
+    assert wrapped.gradient_state.sync_gradients  # no accelerator.accumulate
+    lrs = []
+    for _ in range(n_epochs):
+        for step in range(n_micro_batches):
+            if is_accumulation_boundary(step, n_micro_batches, accum):
+                accelerated_optimizer.step()  # no grads: a no-op, keeps the order
+                wrapped.step()
+                lrs.append(wrapped.get_last_lr()[0])
+    return lrs, scheduler
+
+
+SCHEDULE_CASES = [
+    # n_epochs, sharded loader length, accum, n_warmup_steps, num_processes
+    (2, 5, 4, 1, 2),
+    (1, 7, 2, 2, 3),
+    (3, 4, 1, 2, 4),
+    (2, 10, 4, 3, 1),
+]
+
+
+@pytest.mark.parametrize("scheduler_type", ["linear", "cosine"])
+@pytest.mark.parametrize("n_epochs, n_micro, accum, warmup, P", SCHEDULE_CASES)
+def test_multi_process_schedule_matches_single_process(
+    accelerator, monkeypatch, scheduler_type, n_epochs, n_micro, accum, warmup, P
+):
+    n_steps = num_training_steps(n_epochs, n_micro, accum)
+    args = (accelerator, monkeypatch, scheduler_type, n_epochs, n_micro, accum)
+    expected, _ = lrs_per_optimizer_step(*args, (warmup, n_steps), 1)
+    counts = lr_schedule_steps(n_epochs, n_micro, accum, warmup, P, False)
+    lrs, scheduler = lrs_per_optimizer_step(*args, counts, P)
+    assert len(lrs) == n_steps
+    assert lrs == pytest.approx(expected)
+    # the schedule ends exactly on the last optimizer step, not before
+    assert scheduler.last_epoch == counts[1]
+    assert lrs[-1] == pytest.approx(0.0, abs=1e-12)
+    assert lrs[-2] > 1e-6
+
+
+@pytest.mark.parametrize("n_epochs, n_micro, accum, warmup, P", SCHEDULE_CASES[:3])
+def test_unscaled_schedule_counts_are_wrong_with_several_processes(
+    accelerator, monkeypatch, n_epochs, n_micro, accum, warmup, P
+):
+    # the pre-fix counts: un-sharded loader length (P * sharded), no scaling
+    n_steps = num_training_steps(n_epochs, n_micro, accum)
+    args = (accelerator, monkeypatch, "linear", n_epochs, n_micro, accum)
+    expected, _ = lrs_per_optimizer_step(*args, (warmup, n_steps), 1)
+    old_counts = (warmup, num_training_steps(n_epochs, n_micro * P, accum))
+    lrs, _ = lrs_per_optimizer_step(*args, old_counts, P)
+    assert lrs != pytest.approx(expected)
+
+
+def test_prepared_scheduler_ends_on_last_optimizer_step(tmp_path, accelerator):
+    # the main() pattern on one process: prepare the loader, count, then prepare
+    # the scheduler; the LR must reach the end of its schedule on the last step
+    config = tiny_config(gradient_accumulation_steps=4, n_epochs=2)
+    model = tiny_model(config)
+    base_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loader = DataLoader(make_batches(10, config), batch_size=None)
+    model, optimizer, loader = accelerator.prepare(model, base_optimizer, loader)
+    assert len(loader) == 10
+    counts = lr_schedule_steps(
+        config.n_epochs,
+        len(loader),
+        config.gradient_accumulation_steps,
+        2,
+        accelerator.num_processes,
+        accelerator.split_batches,
+    )
+    assert counts == (2, num_training_steps(2, 10, 4))
+    scheduler = accelerator.prepare(
+        get_scheduler("linear", base_optimizer, counts[0], counts[1])
+    )
+    lrs = []
+    result = run_training(
+        model,
+        optimizer,
+        scheduler,
+        loader,
+        make_batches(1, config),
+        accelerator,
+        config,
+        tmp_path,
+        log=lambda m, step=None: lrs.append(m["learning_rate"])
+        if "learning_rate" in m
+        else None,
+    )
+    assert result["n_optimizer_steps"] == counts[1]
+    assert scheduler.scheduler.last_epoch == counts[1]
+    assert lrs[-1] == 0.0
+    assert lrs[-2] > 0.0  # after the 5th of 6 optimizer steps
