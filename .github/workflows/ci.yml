@@ -1,0 +1,59 @@
+---
+name: CI
+
+# Quoted so YAML 1.1 parsers (yamllint, PyYAML) do not read it as boolean true.
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      WANDB_MODE: disabled
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # Some tests load the GPT-2 tokenizer from the Hugging Face hub, so the
+      # hub must be reachable at least on a cold cache.
+      - name: Cache Hugging Face hub
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/huggingface/hub
+          key: hf-hub-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: hf-hub-${{ runner.os }}-
+
+      # Only what the tests and linters import, at the versions pinned in
+      # requirements.txt; deepspeed, matplotlib and pre-commit are not needed.
+      # wandb is, because llamlam/train.py imports it at module level.
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "torch==$(sed -n 's/^torch==//p' requirements.txt)" \
+            --index-url https://download.pytorch.org/whl/cpu
+          grep -E '^(accelerate|datasets|pytest|ruff|transformers|wandb)==' \
+            requirements.txt > "$RUNNER_TEMP/ci-requirements.txt"
+          pip install -r "$RUNNER_TEMP/ci-requirements.txt"
+
+      - name: Lint
+        run: ruff check llamlam tests
+
+      - name: Format check
+        run: ruff format --check llamlam tests
+
+      - name: Test
+        run: python -m pytest -v tests/
