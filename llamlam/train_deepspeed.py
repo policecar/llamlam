@@ -265,7 +265,7 @@ def main(
         avg_train_loss = train(model_engine, train_loader, model_engine.device)
         val_loss, perp = validate(model_engine, val_loader, device=device)
         logger.info(
-            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+            f"Epoch {epoch + 1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
         )
         wandb.log({"ppl": perp, "loss": val_loss, "epoch": epoch})
 

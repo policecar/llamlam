@@ -375,9 +375,9 @@ def test_optimizer_reduces_loss(cls, name):
         optimizer.step()
     with torch.no_grad():
         final = model(x)["loss"].item()
-    assert (
-        final < initial - 0.05
-    ), f"{name}/{cls.__name__}: {initial:.3f} -> {final:.3f}"
+    assert final < initial - 0.05, (
+        f"{name}/{cls.__name__}: {initial:.3f} -> {final:.3f}"
+    )
     # every parameter moved (no group silently left out of the update)
     stepped = [p for g in optimizer.param_groups for p in g["params"]]
     assert len(stepped) == len(list(model.parameters()))

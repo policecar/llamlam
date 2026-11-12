@@ -102,13 +102,13 @@ def test_extremely_small_learning_rate(model):
     final_loss = model(input_ids)["loss"].item()
     final_params = list(model.parameters())
 
-    assert (
-        abs(final_loss - initial_loss) < 1e-6
-    ), "Loss changed significantly with extremely small learning rate"
+    assert abs(final_loss - initial_loss) < 1e-6, (
+        "Loss changed significantly with extremely small learning rate"
+    )
     for p1, p2 in zip(initial_params, final_params):
-        assert torch.allclose(
-            p1, p2, atol=1e-6
-        ), "Parameters changed significantly with extremely small learning rate"
+        assert torch.allclose(p1, p2, atol=1e-6), (
+            "Parameters changed significantly with extremely small learning rate"
+        )
 
 
 def test_extremely_large_learning_rate(model):
