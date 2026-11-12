@@ -6,14 +6,28 @@ import pytest
 import torch
 import torch.nn as nn
 from torch.autograd import gradcheck
+from torch.func import functional_call
 
-from llamlam.config import LMConfig
-from llamlam.model import GPTModel, Attention, Block
+from llamlam.config import Config
+from llamlam.model import Block, Context, GPTModel
+
+
+@pytest.fixture(autouse=True)
+def _seed():
+    torch.manual_seed(0)
 
 
 @pytest.fixture
 def small_config():
-    return LMConfig(max_length=16, vocab_size=100, n_layer=2, n_head=2, head_width=8)
+    # dropout=0: gradcheck and gradient comparisons need a deterministic forward
+    return Config(
+        max_seq_length=16,
+        vocab_size=100,
+        n_layers=2,
+        n_heads=2,
+        dim_head=8,
+        dropout=0.0,
+    )
 
 
 @pytest.fixture
@@ -22,11 +36,11 @@ def model(small_config):
 
 
 def test_attention_gradient(small_config):
-    attention = Attention(small_config.n_embd, small_config.n_head)
+    attention = Context(small_config.dim_embd, small_config.n_heads)
     attention.double()  # Convert to double precision for numerical stability
 
     input = torch.randn(
-        2, 16, small_config.n_embd, dtype=torch.double, requires_grad=True
+        2, 16, small_config.dim_embd, dtype=torch.double, requires_grad=True
     )
 
     assert gradcheck(attention, (input,), eps=1e-6, atol=1e-4)
@@ -37,22 +51,36 @@ def test_block_gradient(small_config):
     block.double()
 
     input = torch.randn(
-        2, 16, small_config.n_embd, dtype=torch.double, requires_grad=True
+        2, 16, small_config.dim_embd, dtype=torch.double, requires_grad=True
     )
 
     assert gradcheck(block, (input,), eps=1e-6, atol=1e-4)
 
 
 def test_model_gradient(model):
+    """Analytic gradients through the whole stack of blocks match finite differences.
+
+    Token ids are integers and cannot be differentiated, so the check is taken
+    w.r.t. the positional embedding, which enters before the first block. The
+    checked output is the hidden state after the last block: GPTModel casts its
+    logits (and so the loss) to float32 with .float(), which is too coarse for a
+    double-precision finite-difference check.
+    """
     model.double()
     input_ids = torch.randint(0, 100, (2, 16), dtype=torch.long)
+    pos_embed = torch.randn_like(model.pos_embed).requires_grad_(True)
 
-    def loss_fn(model, input_ids):
-        output = model(input_ids)
-        return output["loss"]
+    def last_hidden_state(pos_embed):
+        outputs = functional_call(
+            model,
+            {"pos_embed": pos_embed},
+            (input_ids,),
+            {"output_hidden_states": True},
+        )
+        return outputs["hidden_states"][-1]
 
-    input_ids.requires_grad_(True)
-    assert gradcheck(lambda x: loss_fn(model, x), (input_ids,), eps=1e-6, atol=1e-4)
+    assert last_hidden_state(pos_embed).dtype == torch.double
+    assert gradcheck(last_hidden_state, (pos_embed,), eps=1e-6, atol=1e-4)
 
 
 def test_gradient_magnitude(model):
@@ -111,27 +139,29 @@ def test_gradient_accumulation(model):
 
 def test_gradient_clipping(model):
     input_ids = torch.randint(0, 100, (4, 16))
-    output = model(input_ids)
-    loss = output["loss"]
-    loss.backward()
+    model(input_ids)["loss"].backward()
+    original_grads = [p.grad.clone() for p in model.parameters()]
 
-    # Get the original gradient norm
+    # Get the original gradient norm (max_norm=inf never rescales)
     original_norm = nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
 
-    # Reset gradients
-    model.zero_grad()
-    loss.backward()
+    # Clip to half the original norm so that clipping actually takes effect
+    max_norm = original_norm.item() / 2
+    returned_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    assert torch.isclose(returned_norm, original_norm), "returns the pre-clip norm"
 
-    # Clip gradients
-    max_norm = 1.0
-    nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-
-    # Check if the new gradient norm is at most max_norm
+    # The clipped gradient norm is exactly max_norm ...
     new_norm = nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
-    assert (
-        new_norm <= max_norm + 1e-6
-    ), f"Gradient norm {new_norm} exceeds max_norm {max_norm}"
+    assert torch.isclose(
+        new_norm, torch.tensor(max_norm), rtol=1e-4
+    ), f"Gradient norm {new_norm} is not max_norm {max_norm}"
 
-    # If original norm was smaller than max_norm, it shouldn't have changed
-    if original_norm < max_norm:
-        assert torch.isclose(original_norm, new_norm, atol=1e-6)
+    # ... reached by rescaling every gradient by the same factor
+    for g0, p in zip(original_grads, model.parameters()):
+        torch.testing.assert_close(p.grad, g0 * 0.5, rtol=1e-4, atol=1e-8)
+
+    # A max_norm above the gradient norm leaves the gradients unchanged
+    before = [p.grad.clone() for p in model.parameters()]
+    nn.utils.clip_grad_norm_(model.parameters(), 10 * max_norm)
+    for g0, p in zip(before, model.parameters()):
+        torch.testing.assert_close(p.grad, g0)

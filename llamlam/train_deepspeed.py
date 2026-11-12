@@ -1,4 +1,17 @@
 """
+STATUS: STALE, NOT MAINTAINED. This script does not run against the current code:
+- it imports `CustomDataset` from `llamlam.data` and `Config` from `llamlam.model`,
+  neither of which exists (the config now lives in `llamlam.config.Config`);
+- it builds the config with old field names (`max_length`, `n_head`, `n_layer`,
+  `n_embd`); the current fields are `max_seq_length`, `n_heads`, `n_layers` and
+  `dim_head`, with the embedding size derived as `n_heads * dim_head`;
+- it imports `click`, which is not in requirements.txt;
+- the usage lines below point at `llamlam/train.py`, not this file.
+It has not been updated or verified because DeepSpeed could not be run in the
+development environment. The maintained entry point is `python -m llamlam.train`.
+An unverified rewrite exists in pull request #1:
+https://github.com/policecar/llamlam/pull/1
+
 Based on https://github.com/cloneofsimo/min-max-gpt/blob/main/train.py
 without distributed training (zero optimization, etc.)
 

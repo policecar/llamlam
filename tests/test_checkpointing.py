@@ -1,0 +1,881 @@
+"""
+Checkpoints (llamlam.checkpoint): keep-k-best pruning, last/ round trip, resume
+directory resolution, main-process-only writes, an interrupted-and-resumed
+run matching an uninterrupted one (shuffle order included), saving a tied head
+without Accelerate's shared-tensor warning, and main() resuming with the config
+stored in the checkpoint.
+"""
+
+import dataclasses
+import functools
+import json
+import logging
+import math
+from pathlib import Path
+
+import pytest
+import torch
+import torch.nn as nn
+import yaml
+from accelerate import Accelerator
+from accelerate.state import AcceleratorState
+from datasets import Dataset, DatasetDict
+from safetensors import safe_open
+from torch.optim.adamw import AdamW
+from torch.utils.data import DataLoader
+from transformers import get_scheduler
+
+import llamlam.train as train
+
+from llamlam.checkpoint import (
+    CheckpointManager,
+    load_checkpoint,
+    read_progress,
+    resolve_resume_dir,
+    select_best,
+)
+from llamlam.config import Config
+from llamlam.opt import GrokAdamW, Muon
+from llamlam.train import (
+    build_accelerator,
+    build_model,
+    lr_schedule_steps,
+    num_training_steps,
+    run_training,
+)
+from llamlam.utils import build_optimizer
+
+
+class FakeHandle:
+    def remove(self):
+        pass
+
+
+class FakeAccelerator:
+    """Stands in for accelerate.Accelerator: persists a single integer 'state'."""
+
+    def __init__(self, state=0, is_main_process=True, fail_save=False):
+        self.state = state
+        self.is_main_process = is_main_process
+        self.fail_save = fail_save
+        self.device = torch.device("cpu")
+        self.saved_to = []
+        self.loaded_from = []
+
+    def wait_for_everyone(self):
+        pass
+
+    def register_save_state_pre_hook(self, hook):
+        return FakeHandle()  # save_state below never calls hooks
+
+    def save_state(self, output_dir):
+        self.saved_to.append(Path(output_dir).name)
+        d = Path(output_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        if self.fail_save:
+            raise RuntimeError("killed while saving")
+        (d / "state.bin").write_text(str(self.state))
+
+    def load_state(self, input_dir):
+        self.loaded_from.append(Path(input_dir))
+        self.state = int((Path(input_dir) / "state.bin").read_text())
+
+
+def ckpt_dirs(run_dir):
+    return sorted(p.name for p in Path(run_dir).glob("ckpt_*"))
+
+
+##########################################
+# keep-k-best
+##########################################
+
+
+def test_select_best_keeps_k_lowest():
+    items = [(0.5, "a"), (0.1, "b"), (0.9, "c"), (0.3, "d")]
+    keep, drop = select_best(items, 2)
+    assert keep == [(0.1, "b"), (0.3, "d")]
+    assert sorted(drop) == [(0.5, "a"), (0.9, "c")]
+
+
+@pytest.mark.parametrize("keep_k", [1, 2, 3])
+def test_save_best_keeps_exactly_the_k_lowest_losses(tmp_path, keep_k):
+    # 0.4 is not a new best but is among the 2 lowest when it arrives
+    losses = [0.5, 0.3, 0.4, 0.6, 0.2, 0.35, 0.9]
+    acc = FakeAccelerator()
+    manager = CheckpointManager(acc, tmp_path, keep_k=keep_k)
+    for step, loss in enumerate(losses, start=1):
+        acc.state = step
+        manager.save_best(loss, {"global_step": step})
+        seen = list(enumerate(losses[:step], start=1))
+        lowest = sorted(seen, key=lambda s: s[1])[:keep_k]
+        assert ckpt_dirs(tmp_path) == sorted(f"ckpt_{s:06d}" for s, _ in lowest)
+        assert manager.best == [(loss_, f"ckpt_{s:06d}") for s, loss_ in lowest]
+        for s, loss_ in lowest:  # each kept dir holds its own state and loss
+            d = tmp_path / f"ckpt_{s:06d}"
+            assert (d / "state.bin").read_text() == str(s)
+            assert read_progress(d)["val_loss"] == loss_
+    assert not list(tmp_path.glob("*.tmp")) and not list(tmp_path.glob("*.old"))
+
+
+def test_save_best_skips_non_qualifying_without_writing(tmp_path):
+    acc = FakeAccelerator()
+    manager = CheckpointManager(acc, tmp_path, keep_k=2)
+    manager.save_best(0.2, {"global_step": 1})
+    manager.save_best(0.3, {"global_step": 2})
+    acc.saved_to.clear()
+    assert manager.save_best(0.5, {"global_step": 3}) is None
+    assert manager.save_best(0.3, {"global_step": 4}) is None  # ties keep the earlier
+    assert manager.save_best(float("nan"), {"global_step": 5}) is None
+    assert acc.saved_to == []
+    assert ckpt_dirs(tmp_path) == ["ckpt_000001", "ckpt_000002"]
+
+
+def test_keep_k_zero_keeps_only_last(tmp_path):
+    manager = CheckpointManager(FakeAccelerator(), tmp_path, keep_k=0)
+    assert manager.save_best(0.1, {"global_step": 1}) is None
+    manager.save_last({"global_step": 1, "epoch": 1})
+    assert ckpt_dirs(tmp_path) == [] and (tmp_path / "last").is_dir()
+    with pytest.raises(ValueError, match="keep_k"):
+        CheckpointManager(FakeAccelerator(), tmp_path, keep_k=-1)
+
+
+def test_restored_best_list_keeps_pruning(tmp_path):
+    first = CheckpointManager(FakeAccelerator(), tmp_path, keep_k=2)
+    first.save_best(0.5, {"global_step": 1})
+    first.save_best(0.4, {"global_step": 2})
+    first.save_last({"global_step": 2, "epoch": 1})
+
+    resumed = CheckpointManager(FakeAccelerator(), tmp_path, keep_k=2)
+    resumed.restore(read_progress(tmp_path / "last"))
+    assert resumed.best == [(0.4, "ckpt_000002"), (0.5, "ckpt_000001")]
+    assert resumed.save_best(0.6, {"global_step": 3}) is None
+    resumed.save_best(0.1, {"global_step": 4})
+    assert ckpt_dirs(tmp_path) == ["ckpt_000002", "ckpt_000004"]  # 0.5 pruned
+
+
+##########################################
+# last/ and resume
+##########################################
+
+
+def test_save_last_overwrites_and_round_trips(tmp_path):
+    acc = FakeAccelerator(state=7)
+    manager = CheckpointManager(acc, tmp_path, keep_k=2)
+    manager.save_best(0.25, {"global_step": 5})
+    manager.save_last({"global_step": 10, "tokens_seen": 999, "epoch": 1})
+    acc.state = 8
+    manager.save_last({"global_step": 20, "tokens_seen": 1998, "epoch": 2})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt_000005", "last"]
+
+    restorer = FakeAccelerator(state=0)
+    progress = load_checkpoint(restorer, tmp_path / "last")
+    assert restorer.state == 8  # accelerator state restored, latest save
+    assert progress == {
+        "global_step": 20,
+        "tokens_seen": 1998,
+        "epoch": 2,
+        "resumable": True,
+        "best_checkpoints": [[0.25, "ckpt_000005"]],
+    }
+
+
+def test_failed_save_keeps_previous_last(tmp_path):
+    acc = FakeAccelerator(state=1)
+    manager = CheckpointManager(acc, tmp_path)
+    manager.save_last({"global_step": 4, "epoch": 1})
+    acc.state, acc.fail_save = 2, True
+    with pytest.raises(RuntimeError, match="killed"):
+        manager.save_last({"global_step": 8, "epoch": 2})
+    restorer = FakeAccelerator()
+    assert load_checkpoint(restorer, tmp_path / "last")["global_step"] == 4
+    assert restorer.state == 1
+    # the next successful save clears the leftover temporary directory
+    acc.fail_save = False
+    manager.save_last({"global_step": 8, "epoch": 2})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["last"]
+    assert load_checkpoint(restorer, tmp_path / "last")["global_step"] == 8
+
+
+def test_leftover_old_dir_does_not_break_the_next_save(tmp_path):
+    # left by a kill during the final cleanup, or a failed rmtree(ignore_errors)
+    manager = CheckpointManager(FakeAccelerator(state=1), tmp_path)
+    manager.save_last({"global_step": 4, "epoch": 1})
+    (tmp_path / "last.old").mkdir()
+    (tmp_path / "last.old" / "state.bin").write_text("0")
+    manager.save_last({"global_step": 8, "epoch": 2})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["last"]
+    assert read_progress(tmp_path / "last")["global_step"] == 8
+
+
+def test_kill_between_renames_names_the_intact_old_dir(tmp_path):
+    # last/ was renamed to last.old/, last.tmp/ not yet renamed to last/
+    manager = CheckpointManager(FakeAccelerator(state=1), tmp_path)
+    manager.save_last({"global_step": 4, "epoch": 1})
+    (tmp_path / "last").rename(tmp_path / "last.old")
+    for resume_from in ("latest", str(tmp_path / "last")):
+        with pytest.raises(FileNotFoundError, match="last.old is the intact"):
+            resolve_resume_dir(tmp_path, resume_from)
+    # after the rename the message suggests, it resumes
+    (tmp_path / "last.old").rename(tmp_path / "last")
+    resumed = load_checkpoint(FakeAccelerator(), resolve_resume_dir(tmp_path, "latest"))
+    assert resumed["global_step"] == 4
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_mps_rng_state_round_trips(tmp_path):
+    # accelerate's save_state omits the MPS generator; dropout on MPS uses it
+    acc = FakeAccelerator()
+    acc.device = torch.device("mps")
+    CheckpointManager(acc, tmp_path).save_last({"global_step": 1, "epoch": 1})
+    assert (tmp_path / "last" / "mps_rng_state.pt").is_file()
+    expected = torch.rand(8, device="mps")
+    torch.rand(100, device="mps")  # move the generator on
+    load_checkpoint(acc, tmp_path / "last")
+    assert torch.equal(torch.rand(8, device="mps"), expected)
+
+
+def test_no_mps_rng_file_off_mps(tmp_path):
+    CheckpointManager(FakeAccelerator(), tmp_path).save_last({"epoch": 1})
+    assert not (tmp_path / "last" / "mps_rng_state.pt").exists()
+
+
+def test_best_checkpoints_are_not_resumable(tmp_path):
+    manager = CheckpointManager(FakeAccelerator(), tmp_path)
+    path = manager.save_best(0.1, {"global_step": 3, "epoch": 0})
+    restorer = FakeAccelerator()
+    with pytest.raises(ValueError, match="mid-epoch"):
+        load_checkpoint(restorer, path)
+    assert restorer.loaded_from == []  # refused before touching any state
+
+
+def test_incomplete_checkpoint_is_rejected(tmp_path):
+    (tmp_path / "last").mkdir()
+    (tmp_path / "last" / "state.bin").write_text("3")
+    restorer = FakeAccelerator()
+    with pytest.raises(FileNotFoundError, match="progress.json"):
+        load_checkpoint(restorer, tmp_path / "last")
+    assert restorer.loaded_from == []
+
+
+def test_resolve_resume_dir(tmp_path):
+    assert resolve_resume_dir(tmp_path, None) is None
+    assert resolve_resume_dir(tmp_path, "") is None
+    # "latest" before any epoch finished: nothing to resume, explicit error
+    with pytest.raises(FileNotFoundError, match=str(tmp_path)):
+        resolve_resume_dir(tmp_path, "latest")
+    (tmp_path / "ckpt_000100").mkdir()
+    with pytest.raises(FileNotFoundError):  # ckpt_* are not "latest"
+        resolve_resume_dir(tmp_path, "latest")
+    (tmp_path / "last").mkdir()
+    assert resolve_resume_dir(tmp_path, "latest") == tmp_path / "last"
+
+    explicit = tmp_path / "elsewhere" / "last"
+    with pytest.raises(FileNotFoundError, match="elsewhere"):
+        resolve_resume_dir(tmp_path, str(explicit))
+    explicit.mkdir(parents=True)
+    assert resolve_resume_dir(tmp_path, str(explicit)) == explicit
+
+
+def test_only_main_process_writes(tmp_path):
+    main_dir, worker_dir = tmp_path / "main", tmp_path / "worker"
+    for run_dir in (main_dir, worker_dir):  # a kept checkpoint that gets pruned
+        (run_dir / "ckpt_000001").mkdir(parents=True)
+    main_acc = FakeAccelerator()
+    worker_acc = FakeAccelerator(is_main_process=False)
+    main = CheckpointManager(main_acc, main_dir, keep_k=1)
+    worker = CheckpointManager(worker_acc, worker_dir, keep_k=1)
+    for manager in (main, worker):
+        manager.best = [(0.5, "ckpt_000001")]
+        manager.save_best(0.1, {"global_step": 2})
+        manager.save_best(0.9, {"global_step": 3})
+        manager.save_last({"global_step": 3, "epoch": 1})
+
+    # the worker joins every collective save and tracks the same kept list ...
+    assert worker_acc.saved_to == main_acc.saved_to == ["ckpt_000002.tmp", "last.tmp"]
+    assert worker.best == main.best == [(0.1, "ckpt_000002")]
+    # ... but writes no progress, renames nothing and deletes nothing
+    assert not list(worker_dir.rglob("progress.json"))
+    assert sorted(p.name for p in worker_dir.iterdir()) == [
+        "ckpt_000001",
+        "ckpt_000002.tmp",
+        "last.tmp",
+    ]
+    # while the main process does all three
+    assert sorted(p.name for p in main_dir.iterdir()) == ["ckpt_000002", "last"]
+    assert (main_dir / "last" / "progress.json").is_file()
+
+
+##########################################
+# End to end: interrupt during epoch 1, resume, compare with uninterrupted
+##########################################
+
+N_MICRO = 5
+ACCUM = 2
+
+
+class Interrupted(Exception):
+    pass
+
+
+def e2e_config(**overrides):
+    params = dict(
+        n_layers=1,
+        n_heads=2,
+        dim_head=8,
+        max_seq_length=16,
+        vocab_size=50,
+        dropout=0.1,  # exercises the RNG state restored on resume
+        n_epochs=2,
+        eval_steps=3,
+        gradient_accumulation_steps=ACCUM,
+        n_warmup_steps=2,
+        learning_rate=1e-2,
+        keep_k_checkpoints=2,
+    )
+    params.update(overrides)
+    return Config(**params)
+
+
+def e2e_batches(config):
+    """Dynamically padded batches: rows of different real lengths."""
+    g = torch.Generator().manual_seed(3)
+    batches = []
+    for i in range(N_MICRO):
+        length = 6 + i
+        ids = torch.randint(0, config.vocab_size, (2, length), generator=g)
+        mask = torch.ones_like(ids)
+        mask[1, length - 1 - i % 3 :] = 0
+        batches.append({"input_ids": ids, "attention_mask": mask})
+    return batches
+
+
+class RecordingDataset(torch.utils.data.Dataset):
+    """The e2e batches as dataset items; records the index of every item read."""
+
+    def __init__(self, batches):
+        self.batches = batches
+        self.read = []
+
+    def __len__(self):
+        return len(self.batches)
+
+    def __getitem__(self, index):
+        self.read.append(index)
+        return self.batches[index]
+
+
+def setup_training(config, init_seed):
+    """The main() pattern: prepare, count from the prepared loader, then scheduler."""
+    accelerator = build_accelerator(config, cpu=True)
+    torch.manual_seed(init_seed)
+    model = build_model(config)
+    base_optimizer = build_optimizer(model, config)
+    torch.manual_seed(config.seed)  # main()'s set_seed, which seeds the shuffle
+    batches = e2e_batches(config)
+    # shuffled like main()'s train loader; batch_size=1 keeps each padded batch whole
+    train_data = RecordingDataset(batches)
+    train_loader = DataLoader(
+        train_data, batch_size=1, shuffle=True, collate_fn=lambda items: items[0]
+    )
+    val_loader = DataLoader(batches[:2], batch_size=None)
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, base_optimizer, train_loader, val_loader
+    )
+    counts = lr_schedule_steps(
+        config.n_epochs,
+        len(train_loader),
+        ACCUM,
+        config.n_warmup_steps,
+        accelerator.num_processes,
+        accelerator.split_batches,
+    )
+    scheduler = accelerator.prepare(
+        get_scheduler("linear", base_optimizer, counts[0], counts[1])
+    )
+    return (
+        model, optimizer, scheduler, train_loader, val_loader, accelerator, counts,
+        train_data,
+    )  # fmt: skip
+
+
+def train_run(config, run_dir, init_seed=0, interrupt_epoch=None, resume_dir=None):
+    (
+        model, optimizer, scheduler, train_loader, val_loader, accelerator, counts,
+        train_data,
+    ) = setup_training(config, init_seed)  # fmt: skip
+    logged = []
+
+    def log(metrics, step=None):
+        if metrics.get("epoch") == interrupt_epoch and "train_loss" in metrics:
+            raise Interrupted
+        logged.append((step, metrics))
+
+    try:
+        result = run_training(
+            model,
+            optimizer,
+            scheduler,
+            train_loader,
+            val_loader,
+            accelerator,
+            config,
+            run_dir,
+            log=log,
+            resume_dir=resume_dir,
+        )
+    except Interrupted:
+        result = None
+    step_counts = {
+        int(s["step"]) for s in optimizer.optimizer.state.values() if "step" in s
+    }
+    return {
+        "result": result,
+        "logged": logged,
+        "model": accelerator.unwrap_model(model),
+        "scheduler_last_epoch": scheduler.scheduler.last_epoch,
+        "optimizer_steps": step_counts,
+        "counts": counts,
+        "order": train_data.read,  # train batch indices in the order trained
+    }
+
+
+def epoch_orders(run):
+    order = run["order"]
+    return [order[i : i + N_MICRO] for i in range(0, len(order), N_MICRO)]
+
+
+def lrs(logged):
+    return [(s, m["learning_rate"]) for s, m in logged if "learning_rate" in m]
+
+
+def embedding_of(model):
+    return model.embed if hasattr(model, "embed") else model.token_emb
+
+
+@pytest.mark.parametrize(
+    "model_type, optimizer, tie",
+    [
+        ("gpt", "adamw", True),
+        ("diff", "adamw", True),
+        ("gpt", "muon", True),
+        ("diff", "grokadamw", True),
+        ("gpt", "adamw", False),
+        ("diff", "muon", False),
+    ],
+)
+def test_interrupted_and_resumed_run_matches_uninterrupted(
+    tmp_path, model_type, optimizer, tie
+):
+    config = e2e_config(
+        model_type=model_type, optimizer=optimizer, tie_word_embeddings=tie
+    )
+    full = train_run(config, tmp_path / "full")
+
+    run_dir = tmp_path / "resumed"
+    first = train_run(config, run_dir, interrupt_epoch=1)
+    assert first["result"] is None  # stopped at the first micro-batch of epoch 1
+    progress = read_progress(run_dir / "last")
+    steps_per_epoch = math.ceil(N_MICRO / ACCUM)
+    assert progress["epoch"] == 1
+    assert progress["global_step"] == N_MICRO
+    assert progress["n_optimizer_steps"] == steps_per_epoch
+
+    # a differently initialised model: everything must come from the checkpoint
+    second = train_run(
+        config,
+        run_dir,
+        init_seed=1,
+        resume_dir=resolve_resume_dir(run_dir, "latest"),
+    )
+
+    # counters continue where they left off and end where the full run ends
+    resumed_lrs = lrs(second["logged"])
+    assert resumed_lrs[0][0] == N_MICRO + 1  # first logged step of epoch 1
+    assert resumed_lrs == lrs(full["logged"])[N_MICRO:]  # same LR position
+    for key in ("n_optimizer_steps", "global_step", "tokens_seen", "best_val_loss"):
+        assert second["result"][key] == full["result"][key], key
+    total_steps = num_training_steps(2, N_MICRO, ACCUM)
+    assert second["result"]["n_optimizer_steps"] == total_steps
+    assert second["scheduler_last_epoch"] == full["scheduler_last_epoch"]
+    assert second["scheduler_last_epoch"] == second["counts"][1] == total_steps
+    assert lrs(full["logged"])[-1][1] == 0.0  # the schedule ends on the last step
+    # every per-parameter step counter (AdamW, GrokAdamW, Muon's AdamW path)
+    assert second["optimizer_steps"] == full["optimizer_steps"] == {total_steps}
+    tokens = sum(int(b["attention_mask"].sum()) for b in e2e_batches(config))
+    assert second["result"]["tokens_seen"] == 2 * tokens
+    # the shuffled order: the resumed epoch 1 is the full run's epoch 1, not epoch 0
+    full_orders = epoch_orders(full)
+    assert full_orders[0] != full_orders[1]
+    assert epoch_orders(second) == full_orders[1:]
+
+    # identical training trajectory: same data, same restored RNG for dropout
+    for (n, p), (_, q) in zip(
+        second["model"].named_parameters(), full["model"].named_parameters()
+    ):
+        torch.testing.assert_close(p, q, rtol=1e-5, atol=1e-6, msg=n)
+    # the resumed head is still the embedding matrix (or still separate)
+    for run in (full, second):
+        model = run["model"]
+        assert (model.head.weight is embedding_of(model).weight) is tie
+    torch.testing.assert_close(
+        second["model"].head.weight, full["model"].head.weight, rtol=1e-5, atol=1e-6
+    )
+    # and the same kept-best checkpoints
+    assert ckpt_dirs(run_dir) == ckpt_dirs(tmp_path / "full")
+    assert json.loads((run_dir / "last" / "progress.json").read_text())["epoch"] == 2
+
+
+def test_epoch_order_is_a_function_of_seed_and_epoch(tmp_path):
+    # With several processes the shuffle cannot come from the global RNG (it is
+    # per-process and also drives dropout), so it must depend on nothing else
+    run_ids = iter(range(3))
+
+    def orders(**overrides):
+        config = e2e_config(n_epochs=3, **overrides)
+        return epoch_orders(train_run(config, tmp_path / str(next(run_ids))))
+
+    base = orders()
+    assert len({tuple(order) for order in base}) == 3  # each epoch its own order
+    assert orders(dropout=0.0) == base  # dropout draws from the global RNG
+    other_seed = orders(seed=1)
+    assert all(a != b for a, b in zip(other_seed, base))
+
+
+def test_extending_n_epochs_on_resume_rebuilds_the_lr_schedule(tmp_path):
+    # LambdaLR saves no lambda, so the restored scheduler keeps only its step
+    # count and follows the schedule built from the new n_epochs
+    train_run(e2e_config(n_epochs=1), tmp_path / "one")
+    extended = train_run(e2e_config(n_epochs=2), tmp_path / "one", init_seed=1,
+                         resume_dir=tmp_path / "one" / "last")  # fmt: skip
+    planned = train_run(e2e_config(n_epochs=2), tmp_path / "two")
+    resumed_lrs = lrs(extended["logged"])
+    # until the first optimizer step the restored rate holds: the one-epoch
+    # schedule's end, 0.0 ...
+    assert resumed_lrs[0] == (N_MICRO + 1, 0.0)
+    # ... after it the two-epoch schedule's rates, ending on 0 at its last step
+    first_step = ACCUM - 1
+    assert resumed_lrs[first_step:] == lrs(planned["logged"])[N_MICRO + first_step :]
+    assert resumed_lrs[first_step][1] > 0.0
+    assert extended["result"]["n_optimizer_steps"] == num_training_steps(
+        2, N_MICRO, ACCUM
+    )
+    assert extended["scheduler_last_epoch"] == planned["counts"][1]
+
+
+def test_resume_into_another_run_dir_starts_a_new_best_list(tmp_path):
+    config = e2e_config(keep_k_checkpoints=10)
+    train_run(config, tmp_path / "orig", interrupt_epoch=1)
+    fork = train_run(config, tmp_path / "fork", resume_dir=tmp_path / "orig" / "last")
+    assert fork["result"]["global_step"] == 2 * N_MICRO
+    # only the evaluations of the resumed epoch (after micro-batches 7, 10; end 10)
+    assert ckpt_dirs(tmp_path / "fork") == ["ckpt_000007", "ckpt_000010"]
+    # the kept list names only this run's checkpoints, never the original's
+    kept = read_progress(tmp_path / "fork" / "last")["best_checkpoints"]
+    assert sorted(name for _, name in kept) == ["ckpt_000007", "ckpt_000010"]
+    assert len(ckpt_dirs(tmp_path / "orig")) == 3  # untouched: 1, 4, 5
+
+
+def test_resume_at_final_epoch_trains_nothing(tmp_path):
+    config = e2e_config(n_epochs=1)
+    done = train_run(config, tmp_path)
+    again = train_run(config, tmp_path, resume_dir=tmp_path / "last")
+    assert again["logged"] == []
+    for key in ("n_optimizer_steps", "global_step", "tokens_seen", "best_val_loss"):
+        assert again["result"][key] == done["result"][key]
+    assert math.isnan(again["result"]["avg_train_loss"])
+
+
+def test_resume_counters_cover_every_progress_field(tmp_path):
+    # every counter run_training restores is written to last/, and the config
+    # main() resumes with
+    config = e2e_config(n_epochs=1)
+    train_run(config, tmp_path)
+    progress = read_progress(tmp_path / "last")
+    assert progress["config"] == config.to_dict()
+    assert set(progress) == {
+        "config",
+        "epoch",
+        "global_step",
+        "n_optimizer_steps",
+        "tokens_seen",
+        "best_val_loss",
+        "resumable",
+        "best_checkpoints",
+    }
+
+
+##########################################
+# tied head: no "Removed shared tensor" warning on save
+##########################################
+
+SHARED_WARNING = "Removed shared tensor"
+
+
+def shared_tensor_warnings(caplog):
+    """The removed-tensor name sets Accelerate reported, one per warning."""
+    return [
+        r.getMessage().split("{")[1].split("}")[0]
+        for r in caplog.records
+        if r.name == "accelerate.utils.other" and SHARED_WARNING in r.getMessage()
+    ]
+
+
+def prepared(model_type, tie, extra_sharing=None):
+    """A real Accelerator and a model prepared by it, optionally with extra aliases.
+
+    extra_sharing "pair": two new Linear layers share one weight; "embedding": a
+    new Linear's weight is a further alias of the embedding.
+    """
+    accelerator = Accelerator(cpu=True)
+    torch.manual_seed(0)
+    config = e2e_config(model_type=model_type, tie_word_embeddings=tie)
+    model = build_model(config)
+    if extra_sharing == "pair":
+        model.extra_a = nn.Linear(4, 4, bias=False)
+        model.extra_b = nn.Linear(4, 4, bias=False)
+        model.extra_b.weight = model.extra_a.weight
+    elif extra_sharing == "embedding":
+        model.extra_a = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
+        model.extra_a.weight = embedding_of(model).weight
+    return accelerator, accelerator.prepare(model)
+
+
+def saved_keys(ckpt_dir):
+    with safe_open(Path(ckpt_dir) / "model.safetensors", "pt") as f:
+        return set(f.keys())
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("tie", [True, False])
+def test_save_without_shared_tensor_warning(tmp_path, caplog, model_type, tie):
+    caplog.set_level(logging.WARNING)
+    accelerator, model = prepared(model_type, tie)
+    embedding = "embed.weight" if model_type == "gpt" else "token_emb.weight"
+    path = CheckpointManager(accelerator, tmp_path).save_last({"epoch": 1})
+    assert shared_tensor_warnings(caplog) == []
+    # the same file Accelerate writes itself: one copy of a tied matrix, and
+    # nothing else dropped
+    keys = saved_keys(path)
+    assert embedding in keys
+    assert keys == set(model.state_dict()) - ({"head.weight"} if tie else set())
+
+    # reload into a fresh, differently initialised model: no warning, still tied
+    caplog.clear()
+    saved = {n: p.detach().clone() for n, p in model.named_parameters()}
+    accelerator2 = Accelerator(cpu=True)
+    torch.manual_seed(1)
+    fresh = accelerator2.prepare(
+        build_model(e2e_config(model_type=model_type, tie_word_embeddings=tie))
+    )
+    load_checkpoint(accelerator2, path)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert (fresh.head.weight is embedding_of(fresh).weight) is tie
+    for name, param in fresh.named_parameters():
+        assert torch.equal(param, saved[name]), name
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("tie", [True, False])
+@pytest.mark.parametrize(
+    "extra_sharing, reported",
+    [("pair", "'extra_b.weight'"), ("embedding", "'extra_a.weight'")],
+)
+def test_save_still_reports_other_shared_tensors(
+    tmp_path, caplog, model_type, tie, extra_sharing, reported
+):
+    caplog.set_level(logging.WARNING)
+    accelerator, _ = prepared(model_type, tie, extra_sharing)
+    CheckpointManager(accelerator, tmp_path).save_last({"epoch": 1})
+    # exactly the unexpected alias, never the tied head
+    assert shared_tensor_warnings(caplog) == [reported]
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_tied_head_hook_is_removed_after_save(tmp_path, caplog, model_type, fail):
+    caplog.set_level(logging.WARNING)
+    accelerator, _ = prepared(model_type, tie=True)
+    failing = None
+    if fail:
+
+        def raise_on_save(models, weights, output_dir):
+            raise RuntimeError("killed while saving")
+
+        failing = accelerator.register_save_state_pre_hook(raise_on_save)
+    manager = CheckpointManager(accelerator, tmp_path)
+    if fail:
+        with pytest.raises(RuntimeError, match="killed while saving"):
+            manager.save_last({"epoch": 1})
+        failing.remove()
+    else:
+        manager.save_last({"epoch": 1})
+    assert shared_tensor_warnings(caplog) == []
+    # Accelerate's own save_state, outside the manager, warns as before
+    accelerator.save_state(str(tmp_path / "direct"))
+    assert shared_tensor_warnings(caplog) == ["'head.weight'"]
+
+
+##########################################
+# main(): a resumed run takes its config from the checkpoint
+##########################################
+
+OPTIMIZER_CLASSES = {"adamw": AdamW, "grokadamw": GrokAdamW, "muon": Muon}
+TEXTS = [f"once upon a time, number {i}, there was a tiny model" for i in range(40)]
+RUN_FLAGS = ["--output_dir", "{out}", "--run_name", "r"]
+TINY_FLAGS = [
+    "--model_type", "gpt", "--n_layers", "1", "--n_heads", "2", "--dim_head", "8",
+    "--batch_size", "4", "--n_epochs", "2", "--eval_steps", "4",
+]  # fmt: skip
+
+
+@pytest.fixture
+def run_main(tmp_path, monkeypatch):
+    """
+    run_main(*flags, interrupt_epoch=None): train.main() on CPU on TEXTS, with
+    "{out}" in flags replaced by the output directory. Returns what main()
+    handed to run_training (config, optimizer class), or raises Interrupted.
+    """
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "1")
+    monkeypatch.setenv("WANDB_MODE", "disabled")
+    dataset = DatasetDict(train=Dataset.from_dict({"text": TEXTS}))
+    monkeypatch.setattr(train, "load_dataset", lambda **kwargs: dataset)
+    # defaults of the fresh runs; a resumed run must get these from its checkpoint
+    monkeypatch.setattr(
+        train,
+        "Config",
+        functools.partial(
+            Config, n_data_workers=0, max_seq_length=32, n_warmup_steps=2,
+            gradient_accumulation_steps=2, keep_k_checkpoints=2,
+        ),
+    )  # fmt: skip
+    root_level = logging.getLogger().level
+    AcceleratorState._reset_state(reset_partial_state=True)
+    out = tmp_path / "runs"
+
+    def run(*flags, interrupt_epoch=None):
+        seen = {}
+        run.seen.append(seen)
+
+        def log(metrics, step=None):
+            if metrics.get("epoch") == interrupt_epoch and "train_loss" in metrics:
+                raise Interrupted
+
+        def recording(model, optimizer, *args, **kwargs):
+            seen.update(
+                config=dataclasses.replace(args[4]),
+                optimizer=type(optimizer.optimizer),
+                device=args[3].device.type,
+            )
+            kwargs["log"] = log
+            seen["result"] = run_training(model, optimizer, *args, **kwargs)
+
+        monkeypatch.setattr(train, "run_training", recording)
+        train.main([f.replace("{out}", str(out)) for f in flags])
+        return seen
+
+    run.out = out
+    run.seen = []  # one dict per call
+    yield run
+    AcceleratorState._reset_state(reset_partial_state=True)
+    logging.getLogger().setLevel(root_level)
+
+
+def snapshot(directory):
+    """Every path under directory with its bytes and mtime (None for dirs)."""
+    return {
+        str(p.relative_to(directory)): (
+            (p.read_bytes(), p.stat().st_mtime_ns) if p.is_file() else None
+        )
+        for p in sorted(Path(directory).rglob("*"))
+    }
+
+
+def stored_config(run_dir):
+    return read_progress(Path(run_dir) / "last")["config"]
+
+
+@pytest.mark.parametrize(
+    "model_type, optimizer",
+    [("gpt", "adamw"), ("diff", "grokadamw"), ("gpt", "muon")],
+)
+def test_resume_without_flags_continues_with_the_stored_config(
+    run_main, model_type, optimizer
+):
+    model_flags = TINY_FLAGS + ["--model_type", model_type, "--n_epochs", "3"]
+    with pytest.raises(Interrupted):
+        run_main(*model_flags, "--optimizer", optimizer, *RUN_FLAGS, interrupt_epoch=1)
+    run_dir = run_main.out / "r"
+    with open(run_dir / "config.yaml") as f:
+        fresh_config = yaml.safe_load(f)
+    assert (fresh_config["model_type"], fresh_config["optimizer"]) == (
+        model_type,
+        optimizer,
+    )
+
+    # the model flags repeated (equal to the stored values), --optimizer forgotten
+    with pytest.raises(Interrupted):
+        run_main(*model_flags, "--resume_from", "latest", *RUN_FLAGS,
+                 interrupt_epoch=2)  # fmt: skip
+    assert read_progress(run_dir / "last")["epoch"] == 2  # trained epoch 1
+    # no flags at all but the run's location
+    run_main("--resume_from", "latest", *RUN_FLAGS)
+    assert read_progress(run_dir / "last")["epoch"] == 3  # trained epoch 2
+    for seen in run_main.seen[1:]:  # both resumes
+        assert seen["config"].to_dict() == fresh_config
+        assert seen["optimizer"] is OPTIMIZER_CLASSES[optimizer]
+        assert seen["device"] == "cpu"
+    assert stored_config(run_dir) == fresh_config
+    with open(run_dir / "config.yaml") as f:
+        assert yaml.safe_load(f) == fresh_config
+
+
+def refused_resumes(run_dir):
+    """(flags, error pattern) of resumes that must be refused for TINY_FLAGS' run."""
+    last = ["--resume_from", str(run_dir / "last")]
+    return [
+        (last + ["--n_layers", "3"], r"--n_layers 3 \(checkpoint: 1\)"),
+        (last + ["--learning_rate", "0.01"], r"--learning_rate 0.01 \(checkpoint: 0.0006\)"),
+        (last + ["--weight_decay", "0.5"], r"--weight_decay 0.5 \(checkpoint: 0.01\)"),
+        (last + ["--optimizer", "muon"], r"--optimizer 'muon' \(checkpoint: 'grokadamw'\)"),
+        (last + ["--seed", "1"], r"--seed 1 \(checkpoint: 137\)"),
+        (["--resume_from", str(next(run_dir.glob("ckpt_*")))], "mid-epoch"),
+    ]  # fmt: skip
+
+
+def test_refused_resume_leaves_the_run_dir_unchanged(run_main):
+    run_main(*TINY_FLAGS, "--optimizer", "grokadamw", "--n_epochs", "1", *RUN_FLAGS)
+    run_dir = run_main.out / "r"
+    before = snapshot(run_dir)
+    assert "config.yaml" in before and list(run_dir.glob("ckpt_*/progress.json"))
+    for flags, error in refused_resumes(run_dir):
+        with pytest.raises(ValueError, match=error):
+            run_main(*flags)
+        assert snapshot(run_dir) == before, flags
+
+
+def test_resume_allows_n_epochs_eval_steps_and_keep_k(run_main):
+    run_main(*TINY_FLAGS, "--n_epochs", "1", *RUN_FLAGS)
+    resumed = run_main(
+        "--resume_from", "latest", *RUN_FLAGS,
+        "--n_epochs", "2", "--eval_steps", "3", "--keep_k_checkpoints", "4",
+    )  # fmt: skip
+    config = resumed["config"]
+    assert (config.n_epochs, config.eval_steps, config.keep_k_checkpoints) == (2, 3, 4)
+    run_dir = run_main.out / "r"
+    assert stored_config(run_dir)["n_epochs"] == 2
+    with open(run_dir / "config.yaml") as f:
+        assert yaml.safe_load(f) == config.to_dict()
+    n_micro = 9  # 36 training texts (4 split off for validation), batch size 4
+    assert resumed["result"]["n_optimizer_steps"] == num_training_steps(2, n_micro, 2)
+
+
+def test_checkpoint_without_stored_config_is_refused(run_main):
+    run_main(*TINY_FLAGS, "--n_epochs", "1", *RUN_FLAGS)
+    run_dir = run_main.out / "r"
+    progress = read_progress(run_dir / "last")
+    del progress["config"]  # as written before checkpoints stored their config
+    (run_dir / "last" / "progress.json").write_text(json.dumps(progress))
+    before = snapshot(run_dir)
+    with pytest.raises(ValueError, match="stores no config"):
+        run_main("--resume_from", "latest", *RUN_FLAGS, *TINY_FLAGS)
+    assert snapshot(run_dir) == before

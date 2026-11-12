@@ -6,12 +6,16 @@ Original code: https://github.com/microsoft/unilm/blob/master/Diff-Transformer/m
 """
 
 import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
 from .activation import SwiGLU
+from .generation import generate as _generate
+from .model import causal_lm_loss, check_cache_inputs
 
 
 class RMSNorm(nn.Module):
@@ -54,28 +58,52 @@ class MultiHeadDifferentialAttention(nn.Module):
     def __init__(self, dim_embd, n_heads, lambda_init):
         """
         Args:
-            dim_embd (int): Dimension of the model. Must be divisible by n_heads.
-            n_heads (int): Number of attention heads.
+            dim_embd (int): Dimension of the model. Must be divisible by 2 * n_heads.
+            n_heads (int): Number of *differential* heads (half a baseline
+                Transformer's head count, as in the reference); each is a pair
+                of softmax maps over head_dim = dim_embd // n_heads // 2.
             lambda_init (float): Initial value for lambda.
+
+        @decision DEC-001: Reference (unilm multihead_diffattn.py) projection layout:
+        Q, K, V and output are all dim_embd -> dim_embd; Q/K hold 2 * n_heads
+        components of head_dim, V holds n_heads values of 2 * head_dim.
+        @rationale: Projecting to 2 * dim_embd doubled the attention weights
+        (8 d^2 vs GPT's 4 d^2); this layout makes the layer parameter-matched.
+
+        @decision DEC-002: One lambda per layer, shared by all heads (reference).
+        @rationale: The reference's lambda_q1/k1/q2/k2 are (head_dim,) vectors,
+        giving a single scalar lambda per layer; per-head lambdas deviated
+        from the paper's formulation.
         """
         super().__init__()
-        assert dim_embd % n_heads == 0, "dim_embd must be divisible by n_heads"
+        if dim_embd % (2 * n_heads) != 0:
+            raise ValueError(
+                f"dim_embd ({dim_embd}) must be divisible by 2 * n_heads "
+                f"({2 * n_heads}) for differential attention"
+            )
 
         self.n_heads = n_heads
-        self.dim_head = dim_embd // n_heads
+        self.dim_head = dim_embd // n_heads // 2
 
-        # Linear projections for queries, keys, and values
-        # Project to 2 * d_head per head for differential attention
-        self.W_q = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_k = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_v = nn.Linear(dim_embd, 2 * self.dim_head * n_heads, bias=False)
-        self.W_o = nn.Linear(2 * self.dim_head * n_heads, dim_embd, bias=False)
+        # Linear projections for queries, keys, and values.
+        # Viewed per head as 2 * dim_head: Q/K split into (Q1, Q2)/(K1, K2) of
+        # dim_head each; V stays whole (2 * dim_head) per head.
+        self.W_q = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_k = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_v = nn.Linear(dim_embd, dim_embd, bias=False)
+        self.W_o = nn.Linear(dim_embd, dim_embd, bias=False)
 
-        # Learnable parameters for lambda reparameterization
-        self.lambda_q1 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_k1 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_q2 = nn.Parameter(torch.randn(n_heads, self.dim_head))
-        self.lambda_k2 = nn.Parameter(torch.randn(n_heads, self.dim_head))
+        # Learnable parameters for lambda reparameterization, shape (dim_head,):
+        # one lambda per layer, shared by all heads, as in the reference.
+        # std 0.1 as in the paper/reference, so lambda ~= lambda_init at init
+        # (std 1 made exp(q . k) range into the thousands for dim_head = 64).
+        def _lambda_param():
+            return nn.Parameter(torch.zeros(self.dim_head).normal_(0, 0.1))
+
+        self.lambda_q1 = _lambda_param()
+        self.lambda_k1 = _lambda_param()
+        self.lambda_q2 = _lambda_param()
+        self.lambda_k2 = _lambda_param()
 
         self.lambda_init = lambda_init
 
@@ -96,15 +124,34 @@ class MultiHeadDifferentialAttention(nn.Module):
         nn.init.xavier_uniform_(self.W_o.weight)
         nn.init.constant_(self.rms_scale, 1.0)
 
-    def forward(self, X):
+    def lambda_full(self):
+        """
+        lambda = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
+
+        Returns:
+            Tensor: scalar (shape ()), shared by all heads of the layer
+        """
+        lambda_q1_dot_k1 = torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()
+        lambda_q2_dot_k2 = torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()
+        return (
+            torch.exp(lambda_q1_dot_k1) - torch.exp(lambda_q2_dot_k2) + self.lambda_init
+        )
+
+    def forward(self, X, past_kv=None, use_cache=False):
         """
         Forward pass for Multi-Head Differential Attention.
 
         Args:
-            X (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
+            X (Tensor): Input tensor of shape (batch, sequence_length, dim_embd),
+                only the new positions when past_kv is given.
+            past_kv (tuple, optional): cached (K, V), each of shape
+                (batch, n_heads, past_length, 2 * d_head), K before the Q1/Q2
+                split.
+            use_cache (bool): If True, also return the updated (K, V).
 
         Returns:
-            Tensor: Output tensor after applying differential attention.
+            Tensor: Output tensor after applying differential attention, or
+            (output, (K, V)) when use_cache is True.
         """
         batch, N, dim_embd = X.shape
 
@@ -119,42 +166,38 @@ class MultiHeadDifferentialAttention(nn.Module):
         K = K.view(batch, N, self.n_heads, 2 * self.dim_head).transpose(1, 2)
         V = V.view(batch, N, self.n_heads, 2 * self.dim_head).transpose(1, 2)
 
+        # Prepend cached keys/values: T = past_length + N keys, N queries
+        if past_kv is not None:
+            past_K, past_V = past_kv
+            K = torch.cat((past_K, K), dim=2)  # (batch, n_heads, T, 2 * d_head)
+            V = torch.cat((past_V, V), dim=2)
+        T = K.size(2)
+        past_len = T - N
+
         # Split Q and K into Q1, Q2 and K1, K2
         Q1, Q2 = Q.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
-        K1, K2 = K.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, N, d_head)
+        K1, K2 = K.chunk(2, dim=-1)  # Each of shape: (batch, n_heads, T, d_head)
 
-        # Compute lambda using reparameterization
-        # lambda_val = exp(lambda_q1 . lambda_k1) - exp(lambda_q2 . lambda_k2) + lambda_init
-        # Compute dot products for each head
-        # Shape of lambda_val: (n_heads,)
-        lambda_q1_dot_k1 = torch.sum(
-            self.lambda_q1 * self.lambda_k1, dim=-1
-        ).float()  # (n_heads,)
-        lambda_q2_dot_k2 = torch.sum(
-            self.lambda_q2 * self.lambda_k2, dim=-1
-        ).float()  # (n_heads,)
-        lambda_val = (
-            torch.exp(lambda_q1_dot_k1) - torch.exp(lambda_q2_dot_k2) + self.lambda_init
-        )  # (n_heads,)
-
-        # Expand lambda_val to match attention dimensions
-        # Shape: (batch, n_heads, 1, 1)
-        lambda_val = lambda_val.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        # Compute lambda using reparameterization: one scalar for all heads
+        lambda_val = self.lambda_full()
 
         # ------------------- Causal Mask Implementation ------------------- #
-        # Create a causal mask to prevent attention to future tokens
-        # Shape of mask: (1, 1, N, N)
+        # Create a causal mask to prevent attention to future tokens.
+        # Query i sits at absolute position past_len + i and sees keys
+        # 0..past_len + i; without a cache (past_len = 0) this is tril(N, N).
         mask = (
-            torch.tril(torch.ones((N, N), device=X.device)).unsqueeze(0).unsqueeze(0)
-        )  # (1, 1, N, N)
+            torch.tril(torch.ones((N, T), device=X.device), diagonal=past_len)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        )  # (1, 1, N, T)
         # Replace 1s with 0.0 and 0s with -inf
         mask = mask.masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, 0.0)
         # -------------------------------------------------------------------- #
 
         # Compute attention scores
         scaling = 1 / math.sqrt(self.dim_head)
-        A1 = torch.matmul(Q1, K1.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
-        A2 = torch.matmul(Q2, K2.transpose(-2, -1)) * scaling  # (batch, n_heads, N, N)
+        A1 = torch.matmul(Q1, K1.transpose(-2, -1)) * scaling  # (batch, n_heads, N, T)
+        A2 = torch.matmul(Q2, K2.transpose(-2, -1)) * scaling  # (batch, n_heads, N, T)
 
         # Apply the causal mask
         A1 = A1 + mask  # Mask out future positions
@@ -199,6 +242,8 @@ class MultiHeadDifferentialAttention(nn.Module):
         # Final linear projection
         out = self.W_o(O_concat)  # (batch, N, dim_embd)
 
+        if use_cache:
+            return out, (K, V)
         return out
 
 
@@ -208,33 +253,43 @@ class DiffTransformerLayer(nn.Module):
     Consists of Multi-Head Differential Attention followed by a SwiGLU Feed-Forward Network.
     """
 
-    def __init__(self, dim_embd, n_heads, lambda_init):
+    def __init__(self, dim_embd, n_heads, lambda_init, dropout=0.0):
         """
         Args:
             dim_embd (int): Dimension of the model.
-            n_heads (int): Number of attention heads.
+            n_heads (int): Number of differential heads (see
+                MultiHeadDifferentialAttention), not the baseline head count.
             lambda_init (float): Initial value for lambda in Differential Attention.
+            dropout (float): Residual dropout rate (as in GPT's Block).
         """
         super().__init__()
         self.norm1 = RMSNorm(dim_embd)
         self.attn = MultiHeadDifferentialAttention(dim_embd, n_heads, lambda_init)
         self.norm2 = RMSNorm(dim_embd)
         self.ff = SwiGLU(dim_embd)
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, use_cache=False):
         """
         Forward pass for a single transformer layer.
 
         Args:
             x (Tensor): Input tensor of shape (batch, sequence_length, dim_embd).
+            past_kv, use_cache: see MultiHeadDifferentialAttention.forward.
 
         Returns:
-            Tensor: Output tensor after processing through the layer.
+            Tensor: Output tensor after processing through the layer, or
+            (output, (K, V)) when use_cache is True.
         """
         # Apply Multi-Head Differential Attention with residual connection
-        y = self.attn(self.norm1(x)) + x
+        attn = self.attn(self.norm1(x), past_kv=past_kv, use_cache=use_cache)
+        if use_cache:
+            attn, present = attn
+        y = self.dropout(attn) + x
         # Apply SwiGLU Feed-Forward Network with residual connection
-        z = self.ff(self.norm2(y)) + y
+        z = self.dropout(self.ff(self.norm2(y))) + y
+        if use_cache:
+            return z, present
         return z
 
 
@@ -254,19 +309,28 @@ class DiffTransformer(nn.Module):
         self.config = config
         self.loss_fn = nn.CrossEntropyLoss()
 
-        assert (
-            self.config.dim_embd % self.config.n_heads == 0
-        ), "dim_embd must be divisible by n_heads"
-
+        # @decision DEC-003: config.n_heads is the baseline (GPT) head count; the
+        # model builds n_heads // 2 differential heads of two softmax maps each.
+        # @rationale: Reference ("num_heads set to half of baseline Transformer's
+        # num_heads"): each map then has a GPT head's width (config.dim_head),
+        # so one config compares both models like-for-like.
+        n_heads = self.config.n_heads
+        if n_heads < 2 or n_heads % 2 != 0:
+            raise ValueError(
+                f"n_heads ({n_heads}) must be even and >= 2 for DiffTransformer: "
+                "it is the baseline head count, and the model builds "
+                "n_heads // 2 differential heads of two softmax maps each"
+            )
         self.token_emb = nn.Embedding(self.config.vocab_size, self.config.dim_embd)
         self.pos_emb = nn.Embedding(self.config.max_seq_length, self.config.dim_embd)
         self.layers = nn.ModuleList(
             [
                 DiffTransformerLayer(
                     dim_embd=self.config.dim_embd,
-                    n_heads=self.config.n_heads,
+                    n_heads=n_heads // 2,
                     lambda_init=0.8
                     - 0.6 * math.exp(-0.3 * (l - 1)),  # Decaying lambda_init
+                    dropout=self.config.dropout,
                 )
                 for l in range(1, self.config.n_layers + 1)  # noqa: E741
             ]
@@ -277,6 +341,14 @@ class DiffTransformer(nn.Module):
         # Initialize weights (optional but recommended)
         self._reset_parameters()
 
+        # @decision DEC-004: config.tie_word_embeddings shares token_emb.weight
+        # with head.weight, as in GPTModel; no init change.
+        # @rationale: both are (vocab_size, dim_embd) with the same fan-in and
+        # fan-out, so xavier_uniform gives them the same distribution; the shared
+        # matrix keeps token_emb's init and the head's draw is dropped.
+        if self.config.tie_word_embeddings:
+            self.head.weight = self.token_emb.weight
+
     def _reset_parameters(self):
         """
         Initialize parameters for improved training stability.
@@ -285,26 +357,61 @@ class DiffTransformer(nn.Module):
         nn.init.xavier_uniform_(self.pos_emb.weight)
         nn.init.xavier_uniform_(self.head.weight)
 
-    def forward(self, x, attention_mask=None, output_hidden_states=False):
+    def forward(
+        self,
+        x,
+        attention_mask=None,
+        output_hidden_states=False,
+        past_key_values=None,
+        use_cache=False,
+    ):
         """
         Forward pass for the DiffTransformer.
 
         Args:
-            x (Tensor): Input tensor of token indices of shape (batch, sequence_length).
+            x (Tensor): Input tensor of token indices of shape (batch, sequence_length),
+                only the new tokens when past_key_values is given.
+            attention_mask (Tensor, optional): (batch, sequence_length), 1 = real
+                token, 0 = padding. Padded targets are excluded from the loss;
+                logits are unaffected. Not allowed in cached mode (no loss).
+            past_key_values (list, optional): per-layer (K, V) from a previous call.
+            use_cache (bool): return the updated per-layer (K, V).
 
         Returns:
-            Tensor: Logits for each token in the vocabulary of shape (batch, sequence_length, vocab_size).
+            dict: "logits" (batch, sequence_length, vocab_size); "loss" unless
+            cached (use_cache or past_key_values); "past_key_values" if
+            use_cache; optionally "hidden_states".
+
+        Raises:
+            ValueError: if cache + new length exceeds max_seq_length, the cache
+                has the wrong number of layers, or attention_mask is passed in
+                cached mode.
         """
+        cached = use_cache or past_key_values is not None
+        if cached and attention_mask is not None:
+            raise ValueError(
+                "attention_mask only masks the loss, which cached mode does not compute"
+            )
         batch, N = x.shape
+        past_len = check_cache_inputs(
+            N, past_key_values, len(self.layers), self.config.max_seq_length
+        )
         positions = (
-            torch.arange(N, device=x.device).unsqueeze(0).expand(batch, N)
+            torch.arange(past_len, past_len + N, device=x.device)
+            .unsqueeze(0)
+            .expand(batch, N)
         )  # (batch, N)
         hidden = self.token_emb(x) + self.pos_emb(positions)  # (batch, N, dim_embd)
 
         hidden_states = [hidden] if output_hidden_states else []
 
-        for layer in self.layers:
-            hidden = layer(hidden)
+        presents = []
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values is not None else None
+            hidden = layer(hidden, past_kv=past_kv, use_cache=use_cache)
+            if use_cache:
+                hidden, present = hidden
+                presents.append(present)
             if output_hidden_states:
                 hidden_states.append(hidden)
 
@@ -313,17 +420,11 @@ class DiffTransformer(nn.Module):
 
         outputs = {"logits": logits}
 
-        # Calculate loss if input tokens provided
-        if x is not None:
-            # Shift logits and labels for next-token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = x[..., 1:].contiguous()
-
-            # Calculate cross entropy loss
-            loss = self.loss_fn(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            outputs["loss"] = loss
+        if use_cache:
+            outputs["past_key_values"] = presents
+        # Calculate loss unless decoding with a cache
+        if not cached:
+            outputs["loss"] = causal_lm_loss(self.loss_fn, logits, x, attention_mask)
 
         if output_hidden_states:
             outputs["hidden_states"] = hidden_states
@@ -331,6 +432,7 @@ class DiffTransformer(nn.Module):
         return outputs
 
     def save_pretrained(self, output_dir, tag, optimizer=None):
+        output_dir = Path(output_dir)
         os.makedirs(output_dir, exist_ok=True)
         torch.save(self.state_dict(), output_dir / f"model_{tag}.pt")
         if optimizer is not None:
@@ -343,62 +445,12 @@ class DiffTransformer(nn.Module):
         model.eval()
         return model
 
-    def generate(self, tokenizer, prompt, max_new_tokens=100):
+    def generate(self, tokenizer, prompt, max_new_tokens=100, **kwargs):
         """
-        Generate text from the model.
-
-        Args:
-            tokenizer: Tokenizer instance
-            prompt: Text to start generation with
-            max_new_tokens: Maximum number of new tokens to generate
-
-        Returns:
-            Decoded text
+        Generate text from the model, greedy by default; see
+        llamlam.generation.generate for do_sample / temperature / top_k / top_p.
         """
-        device = torch.device(
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
-
-        self.eval()
-        self.to(device)
-
-        # Encode prompt
-        token_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-
-        # TeuxDeux:
-        # - top_k
-        # - top_p
-        # - temperature
-
-        with torch.no_grad():
-            for _ in range(max_new_tokens):
-                # Crop current context if it exceeds the supported context size
-                # E.g., if LLM supports only 5 tokens, and the context size is 10
-                # then only the last 5 tokens are used as context
-                idx_cond = token_ids[:, -self.config.max_seq_length :]
-
-                # Get the predictions
-                with torch.no_grad():
-                    logits = self(idx_cond)["logits"]
-
-                # Focus only on the last time step
-                # (batch, n_token, vocab_size) becomes (batch, vocab_size)
-                logits = logits[:, -1, :]
-
-                # Get the idx of the vocab entry with the highest logits value
-                idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch, 1)
-
-                # Append sampled index to the running sequence
-                token_ids = torch.cat(
-                    (token_ids, idx_next), dim=1
-                )  # (batch, n_tokens+1)
-
-        # Decode and return the generated text
-        return tokenizer.decode(token_ids[0], skip_special_tokens=True)
+        return _generate(self, tokenizer, prompt, max_new_tokens, **kwargs)
 
 
 # Example usage:
@@ -409,8 +461,8 @@ if __name__ == "__main__":
     # Define model hyperparameters
     config = Config(
         vocab_size=30522,
-        dim_embd=768,
         n_heads=12,
+        dim_head=64,  # dim_embd = n_heads * dim_head = 768
         n_layers=12,
         max_seq_length=512,
     )
@@ -430,5 +482,8 @@ if __name__ == "__main__":
     )  # (batch, N)
 
     # Forward pass
-    logits = model(input_ids)  # (batch, N, vocab_size)
-    print(logits.shape)  # Should output: torch.Size([2, 128, 30522])
+    model.eval()
+    with torch.no_grad():
+        outputs = model(input_ids)
+    print(outputs["logits"].shape)  # Should output: torch.Size([2, 128, 30522])
+    print(f"loss: {outputs['loss'].item():.4f}")

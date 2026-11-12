@@ -1,10 +1,16 @@
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 from llamlam.config import Config
 from llamlam.model import GPTModel
 from llamlam.utils import set_seed
+
+
+@pytest.fixture(autouse=True)
+def _seed():
+    set_seed(0)
 
 
 @pytest.fixture
@@ -132,13 +138,31 @@ def test_overfit_single_batch(model, sample_batch, train_config):
 
 
 def test_generate(model, tokenizer):
-    """Test text generation capability."""
+    """generate() appends max_new_tokens greedy tokens to the prompt, in place.
+
+    The expected text comes from greedy decoding written out in the test, so a
+    wrong token count, non-greedy choice or lost prompt changes the result.
+    """
     prompt = "Once upon a time"
-    generated_text = model.generate(tokenizer, prompt, max_new_tokens=20)
+    max_new_tokens = 20
+    generated_text = model.generate(tokenizer, prompt, max_new_tokens=max_new_tokens)
 
     assert isinstance(generated_text, str)
     assert len(generated_text) > len(prompt)
     assert generated_text.startswith(prompt)
+    # generate() runs where the model lives (CPU here) and does not move it
+    assert {p.device.type for p in model.parameters()} == {"cpu"}
+
+    ids = tokenizer.encode(prompt, return_tensors="pt")
+    model.eval()
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            logits = model(ids[:, -model.config.max_seq_length :])["logits"]
+            ids = torch.cat((ids, logits[:, -1].argmax(-1, keepdim=True)), dim=1)
+    expected = tokenizer.decode(ids[0], skip_special_tokens=True)
+
+    assert generated_text == expected
+    assert model.generate(tokenizer, prompt, max_new_tokens) == generated_text
 
 
 def test_save_and_load(model, config, tmp_path):
@@ -147,6 +171,8 @@ def test_save_and_load(model, config, tmp_path):
     torch.save(model.state_dict(), save_path)
 
     loaded_model = GPTModel(config)
+    # precondition: a fresh model differs, so equality below comes from loading
+    assert not torch.allclose(model.embed.weight, loaded_model.embed.weight)
     loaded_model.load_state_dict(torch.load(save_path, weights_only=True))
 
     for p1, p2 in zip(model.parameters(), loaded_model.parameters()):
@@ -166,7 +192,12 @@ def test_reproducibility(config):
 
 
 def test_attention_mask(model):
-    """Test attention mask functionality."""
+    """attention_mask drops padded targets from the loss; it never changes logits.
+
+    Attention is causal, so right padding cannot influence real positions; the
+    mask (1 = real token, 0 = padding) only removes padded targets from the mean.
+    """
+    model.eval()  # no dropout: the two forward passes must be comparable
     batch_size = 2
     seq_length = 64
     input_ids = torch.randint(0, model.config.vocab_size, (batch_size, seq_length))
@@ -175,13 +206,28 @@ def test_attention_mask(model):
     attention_mask = torch.ones((batch_size, seq_length))
     attention_mask[:, seq_length // 2 :] = 0
 
-    outputs_with_mask = model(input_ids, attention_mask=attention_mask)
-    outputs_without_mask = model(input_ids)
+    with torch.no_grad():
+        outputs_with_mask = model(input_ids, attention_mask=attention_mask)
+        outputs_without_mask = model(input_ids)
 
-    # Outputs should differ when using mask
-    assert not torch.allclose(
-        outputs_with_mask["logits"], outputs_without_mask["logits"]
+    # Logits are identical with and without the mask
+    torch.testing.assert_close(
+        outputs_with_mask["logits"], outputs_without_mask["logits"], rtol=0, atol=0
     )
+
+    # The loss is the mean over targets whose own mask entry is 1
+    logits = outputs_without_mask["logits"][:, :-1]
+    targets = input_ids[:, 1:]
+    real = attention_mask[:, 1:].bool()
+    expected = F.cross_entropy(logits[real], targets[real])
+    torch.testing.assert_close(outputs_with_mask["loss"], expected)
+    assert not torch.allclose(outputs_with_mask["loss"], outputs_without_mask["loss"])
+
+    # A mask that hides every target leaves nothing to average
+    no_targets = torch.zeros_like(attention_mask)
+    no_targets[:, 0] = 1  # position 0 is never a target
+    with pytest.raises(ValueError):
+        model(input_ids, attention_mask=no_targets)
 
 
 def test_gradient_flow(model, sample_batch):

@@ -1,3 +1,14 @@
+"""
+Compare GPTModel with trivial baselines on small, learnable synthetic data.
+
+The data come from a Markov chain over the first N_ACTIVE tokens of the
+vocabulary: the next token follows a fixed rule with probability P_RULE and is
+uniform over the active tokens otherwise. Its unigram distribution is far from
+uniform over the vocabulary (unigram beats uniform), and the next token depends
+on the current one (a sequence model beats unigram). An untrained model is at
+chance level and loses to both baselines.
+"""
+
 import pytest
 import torch
 import torch.nn as nn
@@ -7,9 +18,12 @@ from transformers import AutoTokenizer
 from llamlam.config import Config
 from llamlam.model import GPTModel
 
+N_ACTIVE = 20  # tokens actually used, out of vocab_size
+P_RULE = 0.9  # probability that the next token follows the rule
+MARGIN = 0.5  # nats by which the trained model must beat a baseline
 
-@pytest.fixture
-def config():
+
+def make_config(**overrides):
     return Config(
         max_seq_length=16,
         vocab_size=100,
@@ -17,7 +31,46 @@ def config():
         n_heads=2,
         dim_head=8,
         dropout=0.0,  # Disable dropout for testing
+        **overrides,
     )
+
+
+def markov_batches(n_batches, seed, batch_size=16, seq_length=16):
+    """Sequences where token t+1 = (7 * token t + 3) % N_ACTIVE w.p. P_RULE."""
+    g = torch.Generator().manual_seed(seed)
+    batches = []
+    for _ in range(n_batches):
+        ids = torch.empty(batch_size, seq_length, dtype=torch.long)
+        ids[:, 0] = torch.randint(0, N_ACTIVE, (batch_size,), generator=g)
+        for t in range(1, seq_length):
+            follow = torch.rand(batch_size, generator=g) < P_RULE
+            noise = torch.randint(0, N_ACTIVE, (batch_size,), generator=g)
+            ids[:, t] = torch.where(follow, (7 * ids[:, t - 1] + 3) % N_ACTIVE, noise)
+        batches.append({"input_ids": ids})
+    return batches
+
+
+def train(model, batches, epochs, lr):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    for _ in range(epochs):
+        for batch in batches:
+            loss = model(batch["input_ids"])["loss"]
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+    model.eval()
+    return model
+
+
+def mean_loss(model, batches):
+    with torch.no_grad():
+        return sum(model(b["input_ids"])["loss"].item() for b in batches) / len(batches)
+
+
+@pytest.fixture
+def config():
+    return make_config()
 
 
 @pytest.fixture
@@ -32,16 +85,30 @@ def tokenizer():
 
 
 @pytest.fixture
-def sample_data(config):
-    """Generate synthetic data for testing."""
+def sample_data():
+    """Training data: structured, non-uniform token sequences."""
+    return markov_batches(n_batches=4, seed=0)
+
+
+@pytest.fixture
+def heldout_data():
+    """Fresh sequences from the same process, never trained on."""
+    return markov_batches(n_batches=2, seed=1)
+
+
+@pytest.fixture(scope="module")
+def trained_model():
+    """A model briefly trained (40 Adam steps) on the Markov training data.
+
+    Untied: at this width (dim_embd 16, vocab 100) tying embedding and head
+    slows learning the next-token permutation. After 40 steps held-out accuracy
+    was 0.785-0.823 tied (5 of 8 init seeds below the 0.8 threshold) and
+    0.906-0.910 untied (the Bayes optimum ~0.905). These tests are about the
+    model learning the data; tying is tested in tests/test_parametrisation.py.
+    """
     torch.manual_seed(42)
-    batch_size = 4
-    seq_length = 16
-    n_batches = 5
-    return [
-        {"input_ids": torch.randint(0, config.vocab_size, (batch_size, seq_length))}
-        for _ in range(n_batches)
-    ]  # TODO: use real data
+    model = GPTModel(make_config(tie_word_embeddings=False))
+    return train(model, markov_batches(n_batches=4, seed=0), epochs=10, lr=1e-2)
 
 
 class UniformBaseline(nn.Module):
@@ -71,6 +138,16 @@ class UnigramBaseline(nn.Module):
         super().__init__()
         self.logits = nn.Parameter(torch.ones(vocab_size))
 
+    @torch.no_grad()
+    def fit(self, batches, smoothing=1e-3):
+        """Set logits to the log target-token frequencies (the unigram optimum)."""
+        counts = torch.full_like(self.logits, smoothing)
+        for batch in batches:
+            targets = batch["input_ids"][..., 1:].flatten()
+            counts += torch.bincount(targets, minlength=counts.numel())
+        self.logits.copy_(torch.log(counts / counts.sum()))
+        return self
+
     def forward(self, input_ids):
         batch_size, seq_len = input_ids.shape
         logits = self.logits.unsqueeze(0).unsqueeze(0).expand(batch_size, seq_len, -1)
@@ -82,61 +159,34 @@ class UnigramBaseline(nn.Module):
         return {"loss": loss, "logits": logits}
 
 
-def test_against_uniform_baseline(model, sample_data):
-    """Test that model performs better than uniform distribution baseline."""
-    uniform_baseline = UniformBaseline(model.config.vocab_size)
+def test_against_uniform_baseline(trained_model, heldout_data):
+    """Test that a briefly trained model beats the uniform distribution baseline."""
+    uniform_baseline = UniformBaseline(trained_model.config.vocab_size)
 
-    model_loss = 0
-    baseline_loss = 0
+    model_loss = mean_loss(trained_model, heldout_data)
+    baseline_loss = mean_loss(uniform_baseline, heldout_data)
 
-    for batch in sample_data:
-        input_ids = batch["input_ids"]
-        with torch.no_grad():
-            model_output = model(input_ids)
-            baseline_output = uniform_baseline(input_ids)
-
-        model_loss += model_output["loss"].item()
-        baseline_loss += baseline_output["loss"].item()
-
-    model_loss /= len(sample_data)
-    baseline_loss /= len(sample_data)
-
-    assert model_loss < baseline_loss, (
+    assert model_loss < baseline_loss - MARGIN, (
         f"Model loss {model_loss:.3f} is not better than uniform baseline "
         f"loss {baseline_loss:.3f}"
     )
 
 
-def test_against_unigram_baseline(model, sample_data):
-    """Test that model performs better than unigram frequency baseline."""
-    unigram_baseline = UnigramBaseline(model.config.vocab_size)
-    optimizer = torch.optim.Adam(unigram_baseline.parameters(), lr=0.01)
+def test_against_unigram_baseline(trained_model, sample_data, heldout_data):
+    """Test that a briefly trained model beats the unigram frequency baseline."""
+    unigram_baseline = UnigramBaseline(trained_model.config.vocab_size)
+    unigram_baseline.fit(sample_data)  # same training data as the model
 
-    # Train unigram baseline
-    for _ in range(5):
-        for batch in sample_data:
-            input_ids = batch["input_ids"]
-            loss = unigram_baseline(input_ids)["loss"]
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+    model_loss = mean_loss(trained_model, heldout_data)
+    baseline_loss = mean_loss(unigram_baseline, heldout_data)
 
-    model_loss = 0
-    baseline_loss = 0
+    # The baseline is meaningful: it is clearly better than uniform
+    uniform_loss = mean_loss(
+        UniformBaseline(trained_model.config.vocab_size), heldout_data
+    )
+    assert baseline_loss < uniform_loss - MARGIN
 
-    with torch.no_grad():
-        for batch in sample_data:
-            input_ids = batch["input_ids"]
-            model_output = model(input_ids)
-            baseline_output = unigram_baseline(input_ids)
-
-            model_loss += model_output["loss"].item()
-            baseline_loss += baseline_output["loss"].item()
-
-    model_loss /= len(sample_data)
-    baseline_loss /= len(sample_data)
-
-    assert model_loss < baseline_loss, (
+    assert model_loss < baseline_loss - MARGIN, (
         f"Model loss {model_loss:.3f} is not better than unigram baseline "
         f"loss {baseline_loss:.3f}"
     )
@@ -178,41 +228,49 @@ def test_perplexity_improvement(model, sample_data):
     )
 
 
-def test_next_token_prediction(model):
-    """Test model's ability to predict next tokens."""
-    # Create a simple sequence
-    input_ids = torch.randint(0, model.config.vocab_size, (1, 8))
+def test_next_token_prediction(trained_model, heldout_data):
+    """Test model's ability to predict next tokens on unseen sequences.
 
+    The Bayes-optimal top-1 accuracy is P_RULE + (1 - P_RULE) / N_ACTIVE ~ 0.905;
+    chance level over the vocabulary is 0.01.
+    """
+    correct = total = 0
     with torch.no_grad():
-        logits = model(input_ids)["logits"]
+        for batch in heldout_data:
+            input_ids = batch["input_ids"]
+            predicted_tokens = trained_model(input_ids)["logits"].argmax(dim=-1)
+            correct += (predicted_tokens[:, :-1] == input_ids[:, 1:]).sum().item()
+            total += input_ids[:, 1:].numel()
 
-    # Get predicted tokens
-    predicted_tokens = logits.argmax(dim=-1)
-
-    # Check if any predicted token matches the actual next token
-    matches = (predicted_tokens[:, :-1] == input_ids[:, 1:]).any()
-
-    assert matches, "Model failed to correctly predict any next token"
+    accuracy = correct / total
+    assert accuracy > 0.8, f"Next-token accuracy {accuracy:.3f} is too low"
 
 
-def test_generate_coherent_text(model, tokenizer):
-    """Test model's text generation capabilities."""
+def test_generate_coherent_text(tokenizer):
+    """After memorising a sentence, greedy generation from its start completes it."""
+    sentence = "Once upon a time there was a little cat who lived in a big red house."
     prompt = "Once upon a time"
-    generated_text = model.generate(tokenizer, prompt, max_new_tokens=20)
+    sentence_ids = tokenizer.encode(sentence, return_tensors="pt")
+    prompt_ids = tokenizer.encode(prompt, return_tensors="pt")
+    n_prompt, n_sentence = prompt_ids.size(1), sentence_ids.size(1)
+    assert torch.equal(sentence_ids[:, :n_prompt], prompt_ids)  # precondition
 
-    # Basic coherence checks
-    assert len(generated_text.split()) > len(
-        prompt.split()
-    ), "Model failed to generate new tokens"
-    assert generated_text.startswith(
-        prompt
-    ), "Generated text does not start with the prompt"
-    assert len(set(generated_text.split())) > 1, "Generated text has no variety"
+    torch.manual_seed(42)
+    config = Config(
+        max_seq_length=32,
+        vocab_size=len(tokenizer),
+        n_layers=2,
+        n_heads=2,
+        dim_head=8,
+        dropout=0.0,
+    )
+    model = train(GPTModel(config), [{"input_ids": sentence_ids}], epochs=100, lr=1e-2)
 
-    # Additional checks for generation quality
-    words = generated_text.split()
-    assert len(words) >= 5, "Generated text is too short"
-    assert len(set(words)) / len(words) > 0.3, "Generated text has too much repetition"
+    generated_text = model.generate(
+        tokenizer, prompt, max_new_tokens=n_sentence - n_prompt
+    )
+
+    assert generated_text == sentence, f"Generated {generated_text!r}"
 
 
 def test_model_memorization(model):
