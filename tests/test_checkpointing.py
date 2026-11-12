@@ -879,3 +879,35 @@ def test_checkpoint_without_stored_config_is_refused(run_main):
     with pytest.raises(ValueError, match="stores no config"):
         run_main("--resume_from", "latest", *RUN_FLAGS, *TINY_FLAGS)
     assert snapshot(run_dir) == before
+
+
+FP16_ON_CPU = r"fp16 .*CPU.*use bf16 or no"
+
+
+def test_fp16_on_cpu_run_is_refused_before_anything_is_created(run_main, monkeypatch):
+    wandb_runs = []
+    monkeypatch.setattr(train.wandb, "init", lambda **kwargs: wandb_runs.append(1))
+    with pytest.raises(ValueError, match=FP16_ON_CPU):
+        run_main(*TINY_FLAGS, "--mixed_precision", "fp16", *RUN_FLAGS)
+    assert not run_main.out.exists()
+    assert wandb_runs == []
+
+
+def test_fp16_on_cpu_resume_is_refused_before_anything_is_written(
+    run_main, monkeypatch
+):
+    run_main(*TINY_FLAGS, "--n_epochs", "1", *RUN_FLAGS)
+    run_dir = run_main.out / "r"
+    progress = read_progress(run_dir / "last")
+    progress["config"]["mixed_precision"] = "fp16"  # e.g. trained on MPS
+    (run_dir / "last" / "progress.json").write_text(json.dumps(progress))
+    before = snapshot(run_dir)
+    wandb_runs = []
+    monkeypatch.setattr(train.wandb, "init", lambda **kwargs: wandb_runs.append(1))
+    # a resume is a new process; the first run's mixed_precision="no" would
+    # otherwise make Accelerate refuse to change it
+    AcceleratorState._reset_state(reset_partial_state=True)
+    with pytest.raises(ValueError, match=FP16_ON_CPU):
+        run_main("--resume_from", "latest", *RUN_FLAGS)
+    assert snapshot(run_dir) == before
+    assert wandb_runs == []

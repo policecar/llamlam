@@ -9,6 +9,10 @@ a GPT-2-style transformer (`llamlam/model.py`).
 
 ## Installation
 
+Needs Python 3.11 or later (torch 2.15.0); CI and local runs use Python 3.12.
+torch 2.15.0 has wheels for macOS 14 or later on Apple silicon only (none for
+Intel Macs), Linux x86_64/aarch64 with glibc 2.28 or later, and Windows x86_64.
+
 ```bash
 # Make virtual env
 uv venv
@@ -45,12 +49,14 @@ Flags (see `python -m llamlam.train --help`; defaults live in `llamlam/config.py
   0.02); the LR schedule scales both Muon rates, and both are logged
   (`learning_rate`, `muon_learning_rate`)
 - `--mixed_precision {no,fp16,bf16}`: mixed-precision mode, passed to
-  `Accelerator` (accelerate 1.0.1). On Apple MPS (the default device on a Mac)
-  only `no` works: `fp16` and `bf16` raise when the `Accelerator` is created.
-  On CPU `bf16` autocasts to bfloat16, while `fp16` is accepted but does
-  nothing (training stays in float32). On CUDA GPUs `fp16` uses a gradient
-  scaler and `bf16` needs `torch.cuda.is_bf16_supported()` (read from the
-  accelerate source, not tested on a GPU)
+  `Accelerator` (accelerate 1.15.0, torch 2.15.0). Tested on Apple MPS (the
+  default device on a Mac) and CPU: `bf16` autocasts the forward pass to
+  bfloat16 on both; `fp16` autocasts to float16 with a gradient scaler on MPS.
+  `fp16` on CPU is an error, since Accelerate would accept it and still train
+  in float32; use `bf16` or `no` there. Weights and optimizer state stay
+  float32. On CUDA GPUs `fp16` uses a gradient scaler and `bf16` needs
+  `torch.cuda.is_bf16_supported()` (read from the accelerate source, not
+  tested on a GPU)
 - `--resume_from <dir>|latest`: resume from a `last/` checkpoint directory, or
   with `latest` from the run named by `--output_dir`/`--run_name`. The run
   continues with the config stored in the checkpoint, so no other flags are
@@ -58,7 +64,9 @@ Flags (see `python -m llamlam.train --help`; defaults live in `llamlam/config.py
   given with a different value; any other flag that differs from the stored
   value is an error. With a new `--n_epochs` the LR schedule is rebuilt for
   the new length: after the first optimizer step the rate is that of a run
-  planned with that many epochs, so a decayed rate jumps back up
+  planned with that many epochs, so a decayed rate jumps back up. A lower
+  `--keep_k_checkpoints` does not delete `ckpt_*` directories already on disk
+  beyond the new limit; remove those by hand
 - `--keep_k_checkpoints N`: number of best (lowest validation loss) checkpoints to keep
 - `--n_layers`, `--n_heads`, `--dim_head`: model size (embedding size is `n_heads * dim_head`)
 - `--run_name`, `--output_dir`: run directory is `<output_dir>/<run_name>`
@@ -115,6 +123,19 @@ Some tests load the GPT-2 tokenizer (`AutoTokenizer.from_pretrained("gpt2")`),
 so they need access to the Hugging Face hub or an already populated local cache.
 CI (`.github/workflows/ci.yml`) runs the same lint and test commands on every
 push and pull request.
+
+### Two processes on a Mac
+
+On macOS a two-process CPU run (`ACCELERATE_USE_CPU=1 python -m
+torch.distributed.run --nproc_per_node 2 -m llamlam.train ...`) fails at its
+first barrier with `NotImplementedError: The distributed operator
+'c10d::barrier' is not currently implemented for the MPS device`: since 1.11,
+accelerate passes `device_ids` to the barrier, and torch then runs the gloo
+barrier on the detected accelerator, MPS. Linux and CUDA should be unaffected
+(read from the source, not run). The package does not work around this;
+`scripts/two_process_cpu_check.py` does, for itself only, and compares an
+interrupted and resumed two-process run with an uninterrupted one (launch
+commands in its docstring).
 
 ## TeuxDeux
 
