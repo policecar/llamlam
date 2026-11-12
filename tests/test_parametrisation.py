@@ -114,7 +114,7 @@ def test_tying_removes_exactly_one_vocab_by_dim_matrix(model_cls):
 
 
 def test_parameter_counts_at_default_config():
-    """The totals quoted in the README / review report, tied and untied."""
+    """Exact parameter totals at the default config, tied and untied."""
     expected = {
         (GPTModel, True): 124_337_664,
         (GPTModel, False): 162_935_040,
