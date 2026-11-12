@@ -27,8 +27,11 @@ pre-commit install
 ```bash
 python -m llamlam.train
 
-# e.g. the GPT model with Muon and bf16
-python -m llamlam.train --model_type gpt --optimizer muon --mixed_precision bf16
+# e.g. the GPT model with Muon
+python -m llamlam.train --model_type gpt --optimizer muon
+
+# resume a run where its last finished epoch left off
+python -m llamlam.train --resume_from latest --output_dir <dir> --run_name <name>
 ```
 
 Flags (see `python -m llamlam.train --help`; defaults live in `llamlam/config.py`):
@@ -41,9 +44,21 @@ Flags (see `python -m llamlam.train --help`; defaults live in `llamlam/config.py
   of Muon's orthogonalised updates of the hidden weight matrices (default
   0.02); the LR schedule scales both Muon rates, and both are logged
   (`learning_rate`, `muon_learning_rate`)
-- `--mixed_precision {no,fp16,bf16}`: mixed-precision mode, passed to `Accelerator`
-- `--resume_from <dir>|latest`: resume from a checkpoint directory, or with
-  `latest` from the run named by `--output_dir`/`--run_name`
+- `--mixed_precision {no,fp16,bf16}`: mixed-precision mode, passed to
+  `Accelerator` (accelerate 1.0.1). On Apple MPS (the default device on a Mac)
+  only `no` works: `fp16` and `bf16` raise when the `Accelerator` is created.
+  On CPU `bf16` autocasts to bfloat16, while `fp16` is accepted but does
+  nothing (training stays in float32). On CUDA GPUs `fp16` uses a gradient
+  scaler and `bf16` needs `torch.cuda.is_bf16_supported()` (read from the
+  accelerate source, not tested on a GPU)
+- `--resume_from <dir>|latest`: resume from a `last/` checkpoint directory, or
+  with `latest` from the run named by `--output_dir`/`--run_name`. The run
+  continues with the config stored in the checkpoint, so no other flags are
+  needed. Only `--n_epochs`, `--eval_steps` and `--keep_k_checkpoints` may be
+  given with a different value; any other flag that differs from the stored
+  value is an error. With a new `--n_epochs` the LR schedule is rebuilt for
+  the new length: after the first optimizer step the rate is that of a run
+  planned with that many epochs, so a decayed rate jumps back up
 - `--keep_k_checkpoints N`: number of best (lowest validation loss) checkpoints to keep
 - `--n_layers`, `--n_heads`, `--dim_head`: model size (embedding size is `n_heads * dim_head`)
 - `--run_name`, `--output_dir`: run directory is `<output_dir>/<run_name>`

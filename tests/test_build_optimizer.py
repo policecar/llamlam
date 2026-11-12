@@ -100,6 +100,21 @@ def test_grokadamw_per_tensor_clipping_follows_config(clipping, expected):
     assert all(g["gradient_clipping"] == expected for g in optimizer.param_groups)
 
 
+@pytest.mark.parametrize("name", OPTIMIZER_CLASSES)
+def test_negative_gradient_clipping_raises_for_every_optimizer(name):
+    # a negative max norm makes clip_grad_norm_'s coefficient negative, which
+    # flips every gradient under AdamW and Muon; 0 and None disable clipping
+    for clipping in (0, None):
+        build_optimizer(
+            tiny_model(GPTModel),
+            tiny_config(optimizer=name, gradient_clipping=clipping),
+        )
+    with pytest.raises(ValueError, match="gradient_clipping must be >= 0"):
+        build_optimizer(
+            tiny_model(GPTModel), tiny_config(optimizer=name, gradient_clipping=-1.0)
+        )
+
+
 ##########################################
 # Muon routing
 ##########################################

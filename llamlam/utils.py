@@ -181,10 +181,16 @@ def build_optimizer(model, config):
 
     config.muon_learning_rate is read only for "muon".
 
-    Raises ValueError for an unknown optimizer name.
+    Raises ValueError for an unknown optimizer name, and for a negative
+    config.gradient_clipping, which the training loop's clipping also reads.
     """
     name = check_choice("optimizer", config.optimizer, OPTIMIZERS)
     lr, weight_decay = config.learning_rate, config.weight_decay
+    if (config.gradient_clipping or 0) < 0:  # flips the gradients in clip_grad_norm_
+        raise ValueError(
+            f"gradient_clipping must be >= 0 (0 or None disables clipping), "
+            f"got {config.gradient_clipping}"
+        )
 
     if name == "adamw":
         return AdamW(

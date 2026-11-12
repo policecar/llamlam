@@ -11,12 +11,17 @@ from pathlib import Path
 import torch
 import wandb
 
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_scheduler
 
-from llamlam.checkpoint import CheckpointManager, load_checkpoint, resolve_resume_dir
+from llamlam.checkpoint import (
+    CheckpointManager,
+    load_checkpoint,
+    read_resumable_progress,
+    resolve_resume_dir,
+)
 from llamlam.config import (
     MIXED_PRECISION_MODES,
     MODEL_TYPES,
@@ -129,7 +134,9 @@ def parse_args(argv=None):
         "--resume_from",
         type=str,
         help="Resume from a last/ checkpoint directory, or 'latest' for the last/ "
-        "of the run named by --output_dir/--run_name. Resume is epoch-granular",
+        "of the run named by --output_dir/--run_name. Resume is epoch-granular and "
+        "uses the config stored in the checkpoint; only --n_epochs, --eval_steps "
+        "and --keep_k_checkpoints may differ from it",
     )
     return parser.parse_args(argv)
 
@@ -162,16 +169,79 @@ def build_config(args, config=None):
     other optimizer reads it, so accepting it would suggest an effect it lacks.
     """
     config = Config() if config is None else config
-    overrides = {
-        name: value
-        for name, value in vars(args).items()
-        if name not in RUN_OPTIONS and value is not None
-    }
+    overrides = given_config_flags(args)
     config = apply_overrides(config, overrides)
     if "muon_learning_rate" in overrides and config.optimizer != "muon":
         raise ValueError(
             f"--muon_learning_rate only applies to --optimizer muon, "
             f"not {config.optimizer!r}; use --learning_rate"
+        )
+    return config
+
+
+def given_config_flags(args):
+    """The Config fields given on the command line (every flag defaults to None)."""
+    return {
+        name: value
+        for name, value in vars(args).items()
+        if name not in RUN_OPTIONS and value is not None
+    }
+
+
+# @decision DEC-003: a resumed run's config is the one stored in its checkpoint;
+#   a flag may only change it for the fields in RESUME_CHANGEABLE
+# @rationale: main() used to build the config from the resuming command's flags,
+#   so a forgotten flag resumed a GrokAdamW/Muon run into AdamW, or failed on a
+#   size mismatch after overwriting config.yaml with defaults, and --learning_rate
+#   / --weight_decay were recorded but overridden by the restored optimizer and
+#   scheduler state. Refusing a contradicting flag keeps the record truthful.
+RESUME_CHANGEABLE = (
+    # extends (or shortens) the run. The LR schedule is rebuilt for the new total
+    # (LambdaLR saves only its step count): from the second resumed optimizer step
+    # on, the rate is that of a run planned with the new n_epochs, so a decayed
+    # rate jumps up; the first step still uses the restored rate
+    "n_epochs",
+    # when to evaluate and save ckpt_*; leaves the optimizer alone, but every
+    # evaluation draws once from the global RNG (DataLoader iterator seed), so
+    # later dropout masks differ from a run with the old value
+    "eval_steps",
+    # how many ckpt_* to keep; when lowered, surplus ones on disk are not deleted
+    "keep_k_checkpoints",
+)
+
+
+def resume_config(args, progress, resume_dir):
+    """
+    The config to resume with: the one stored in the checkpoint's `progress`,
+    with the RESUME_CHANGEABLE fields given on the command line applied.
+
+    Raises ValueError if the checkpoint stores no config, or for a given flag
+    that differs from the stored value and may not change on resume.
+    """
+    stored = progress.get("config")
+    if stored is None:
+        raise ValueError(
+            f"{resume_dir} stores no config (it was written before checkpoints "
+            f"did), so it cannot be resumed; start a new run"
+        )
+    fields = {k: v for k, v in stored.items() if k != "dim_embd"}  # derived
+    config = apply_overrides(Config(), fields)
+    conflicts = [
+        f"--{name} {value!r} (checkpoint: {getattr(config, name)!r})"
+        for name, value in given_config_flags(args).items()
+        if name not in RESUME_CHANGEABLE and value != getattr(config, name)
+    ]
+    if conflicts:
+        raise ValueError(
+            f"Cannot resume {resume_dir} with {', '.join(conflicts)}: a resumed run "
+            f"keeps the config stored in its checkpoint, only "
+            f"{', '.join(RESUME_CHANGEABLE)} may change"
+        )
+    config = build_config(args, config)
+    if config.n_epochs != stored["n_epochs"]:
+        logger.warning(
+            f"n_epochs {stored['n_epochs']} -> {config.n_epochs}: the LR schedule "
+            f"is rebuilt for {config.n_epochs} epochs (see RESUME_CHANGEABLE)"
         )
     return config
 
@@ -204,12 +274,24 @@ def build_model(config):
     )
 
 
+# @decision DEC-004: shuffle with Accelerate's seedable sampler, setting the
+#   train loader's epoch before every epoch
+# @rationale: on several processes accelerate 1.0.1 shuffles with a constant-seeded
+#   torch.Generator() that save_state does not save, so the order ignored --seed
+#   and a resumed epoch k replayed epoch 0. The seedable sampler seeds epoch k with
+#   torch's seed at prepare() (config.seed) + k, k coming from set_epoch also in a
+#   resumed process: epoch k's order depends on (seed, k) only, on any number of
+#   processes. (So seed s's epoch k+1 is seed s+1's epoch k.)
 def build_accelerator(config, **kwargs):
     """Accelerator with config.mixed_precision; raises ValueError for unknown modes."""
     mixed_precision = check_choice(
         "mixed_precision", config.mixed_precision, MIXED_PRECISION_MODES
     )
-    return Accelerator(mixed_precision=mixed_precision, **kwargs)
+    return Accelerator(
+        mixed_precision=mixed_precision,
+        dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
+        **kwargs,
+    )
 
 
 ##########################################
@@ -377,9 +459,12 @@ def run_training(
             "n_optimizer_steps": n_optimizer_steps,
             "tokens_seen": tokens_seen,
             "best_val_loss": best_val_loss,
+            "config": config.to_dict(),  # what main() resumes with, see resume_config
         }
 
     for epoch in range(start_epoch, config.n_epochs):
+        if hasattr(train_loader, "set_epoch"):  # shuffle order of epoch, DEC-004
+            train_loader.set_epoch(epoch)
         train_loss = 0.0
         epoch_tokens = 0  # this process's share, summed over processes when used
         optimizer.zero_grad()  # reset gradients
@@ -476,12 +561,16 @@ def main(argv=None):
 
     args = parse_args(argv)
     configure_logging(debug=args.debug)
-    config = build_config(args)
     logger.info(f"Arguments parsed: {vars(args)}")
 
-    # Resolve the run and resume directories (raises before anything is created)
+    # Resolve the run and resume directories and the config; a resume reads and
+    # checks its checkpoint here, so a refused one raises before anything is written
     run_name, output_dir = resolve_run_dir(args)
     resume_dir = resolve_resume_dir(output_dir, args.resume_from)
+    if resume_dir is None:
+        config = build_config(args)
+    else:
+        config = resume_config(args, read_resumable_progress(resume_dir), resume_dir)
     os.makedirs(output_dir, exist_ok=True)
     logger.info(f"Run directory: {output_dir}")
     if resume_dir is not None:

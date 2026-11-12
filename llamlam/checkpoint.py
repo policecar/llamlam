@@ -11,7 +11,8 @@ Every checkpoint holds what `accelerator.save_state` writes (model, optimizer,
 LR scheduler, RNG states, grad scaler), the MPS RNG state when training on MPS
 (which save_state omits), plus `progress.json` with the counters
 Accelerate does not track (epoch, global_step, n_optimizer_steps, tokens_seen,
-best_val_loss) and the list of kept best checkpoints.
+best_val_loss), the list of kept best checkpoints and the run's config
+(`Config.to_dict()`, which a resume continues with; see train.resume_config).
 
 Resume is epoch-granular: only `last/` (written at an epoch boundary) is
 resumable, and an epoch interrupted part-way is restarted from its beginning.
@@ -181,8 +182,9 @@ class CheckpointManager:
         old = self.run_dir / f"{name}.old"
         accelerator = self.accelerator
         accelerator.wait_for_everyone()
-        if self.is_main_process:
-            shutil.rmtree(tmp, ignore_errors=True)  # left over from a killed save
+        if self.is_main_process:  # left over from a killed save or failed cleanup
+            for leftover in (tmp, old):
+                shutil.rmtree(leftover, ignore_errors=True)
         accelerator.wait_for_everyone()
         handle = accelerator.register_save_state_pre_hook(drop_tied_head(accelerator))
         try:
@@ -222,9 +224,23 @@ def resolve_resume_dir(run_dir, resume_from):
     else:
         path = Path(resume_from)
         hint = ""
+    old = path.with_name(f"{path.name}.old")
+    if not path.is_dir() and old.is_dir():  # killed between _write's two renames
+        hint += f"; {old} is the intact previous checkpoint, rename it to {path}"
     if not path.is_dir():
         raise FileNotFoundError(f"No checkpoint directory {path} to resume from{hint}")
     return path
+
+
+def read_resumable_progress(ckpt_dir):
+    """The progress of an epoch-boundary checkpoint; raises for a mid-epoch one."""
+    progress = read_progress(ckpt_dir)
+    if not progress.get("resumable", False):
+        raise ValueError(
+            f"{ckpt_dir} was saved mid-epoch (step {progress.get('global_step')}); "
+            f"resume is epoch-granular, so resume from a {LAST_DIR}/ checkpoint"
+        )
+    return progress
 
 
 def read_progress(ckpt_dir):
@@ -247,12 +263,7 @@ def load_checkpoint(accelerator, ckpt_dir):
     load_state restores into it. Raises ValueError for a mid-epoch (best)
     checkpoint, which cannot be resumed exactly.
     """
-    progress = read_progress(ckpt_dir)
-    if not progress.get("resumable", False):
-        raise ValueError(
-            f"{ckpt_dir} was saved mid-epoch (step {progress.get('global_step')}); "
-            f"resume is epoch-granular, so resume from a {LAST_DIR}/ checkpoint"
-        )
+    progress = read_resumable_progress(ckpt_dir)
     accelerator.load_state(str(ckpt_dir))
     mps_rng = Path(ckpt_dir) / MPS_RNG_FILE
     if mps_rng.is_file() and accelerator.device.type == "mps":
