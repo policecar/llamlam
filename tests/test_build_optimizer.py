@@ -213,7 +213,13 @@ def test_weight_decay_applies_exactly_to_decay_group(cls, name):
     lr = model.config.learning_rate
     for (n, p), (_, p0) in zip(model.named_parameters(), before.named_parameters()):
         if id(p) in decayed and id(p) not in muon_ids:  # Muon has no weight decay
-            torch.testing.assert_close(p, p0 * (1 - lr * 0.1), msg=n)
+            # Compare the decrement p0 - p = p0 * lr * wd (3e-4 * p0), not p: the
+            # default tolerance on p (atol 1e-5) exceeds the whole decay of a
+            # 0.02-scale weight, so wd 0.08 passed. In float32, rounding 1 - 3e-4
+            # and then p0 * (1 - 3e-4) costs <= 2 * 2**-24 * |p0| = 1.2e-7 * |p0|,
+            # and p0 - p is exact, so the decrement is off by <= 4e-4 of itself
+            # (2.3e-4 measured); rtol 1e-2 leaves 25x margin, fails a 5% error.
+            torch.testing.assert_close(p0 - p, p0 * lr * 0.1, rtol=1e-2, atol=0, msg=n)
         else:
             torch.testing.assert_close(p, p0, rtol=0, atol=0, msg=n)
 

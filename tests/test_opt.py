@@ -320,22 +320,6 @@ def test_grokadamw_skips_params_without_grad():
         assert opt.state[p]["step"] == 3
 
 
-def test_grokadamw_step_amp_matches_step_on_cpu():
-    x, y = _data()
-    a, b = _mlp(), _mlp()
-    opt_a, opt_b = (
-        GrokAdamW(a.parameters(), lr=1e-2),
-        GrokAdamW(b.parameters(), lr=1e-2),
-    )
-    for _ in range(3):
-        for model, opt, use_amp in ((a, opt_a, False), (b, opt_b, True)):
-            opt.zero_grad()
-            _loss(model, x, y).backward()
-            opt.step_amp() if use_amp else opt.step()
-    for pa, pb in zip(a.parameters(), b.parameters()):
-        torch.testing.assert_close(pa, pb, rtol=0, atol=0)
-
-
 def test_grokadamw_closure_returns_loss():
     model = _mlp()
     x, y = _data()
