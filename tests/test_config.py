@@ -147,6 +147,33 @@ def test_choice_tuples_match_implementations():
     assert MIXED_PRECISION_MODES == ("no", "fp16", "bf16")
 
 
+def test_muon_learning_rate_flag_takes_effect_with_muon():
+    assert Config().muon_learning_rate == 0.02
+    config = build_config(
+        parse_args(["--optimizer", "muon", "--muon_learning_rate", "0.05"])
+    )
+    assert config.muon_learning_rate == 0.05
+    assert config.learning_rate == Config().learning_rate  # untouched
+
+
+@pytest.mark.parametrize("optimizer", [None, "adamw", "grokadamw"])
+def test_muon_learning_rate_flag_rejected_without_muon(optimizer):
+    argv = ["--muon_learning_rate", "0.05"]
+    if optimizer is not None:
+        argv += ["--optimizer", optimizer]
+    with pytest.raises(ValueError, match="only applies to --optimizer muon"):
+        build_config(parse_args(argv))
+
+
+def test_muon_learning_rate_help_says_muon_only(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--muon_learning_rate" in help_text
+    assert "Only with --optimizer muon" in help_text
+    assert "(default: 0.02)" in help_text
+
+
 def test_resume_from_is_a_run_option_not_a_config_field(tmp_path):
     args = parse_args(["--resume_from", "latest"])
     assert args.resume_from == "latest"

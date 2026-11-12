@@ -7,6 +7,8 @@ import copy
 
 import pytest
 import torch
+from accelerate import Accelerator
+from accelerate.optimizer import AcceleratedOptimizer
 from torch.optim.adamw import AdamW
 from transformers import get_scheduler
 
@@ -14,7 +16,12 @@ from llamlam.config import Config
 from llamlam.difftransformer import DiffTransformer
 from llamlam.model import GPTModel
 from llamlam.opt import GrokAdamW, Muon
-from llamlam.utils import build_optimizer, get_grouped_params, muon_param_split
+from llamlam.utils import (
+    build_optimizer,
+    current_learning_rates,
+    get_grouped_params,
+    muon_param_split,
+)
 
 MODELS = [GPTModel, DiffTransformer]
 OPTIMIZER_CLASSES = {"adamw": AdamW, "grokadamw": GrokAdamW, "muon": Muon}
@@ -98,8 +105,9 @@ def test_grokadamw_per_tensor_clipping_follows_config(clipping, expected):
 ##########################################
 
 
-def test_muon_split_gpt():
-    model = tiny_model(GPTModel)
+@pytest.mark.parametrize("tie", [True, False])
+def test_muon_split_gpt(tie):
+    model = tiny_model(GPTModel, tie_word_embeddings=tie)
     muon, adamw = muon_param_split(model)
     expected_muon = {
         f"blocks.{i}.{n}.weight"
@@ -114,13 +122,16 @@ def test_muon_split_gpt():
     assert names(model, muon) == expected_muon
     all_names = {n for n, _ in model.named_parameters()}
     assert names(model, adamw) == all_names - expected_muon
-    assert {"embed.weight", "pos_embed", "head.weight", "ln_f.weight"} <= names(
-        model, adamw
-    )
+    assert {"embed.weight", "pos_embed", "ln_f.weight"} <= names(model, adamw)
+    # the head goes to AdamW; tied, it is the embedding matrix, listed once
+    assert sum(p is model.head.weight for p in adamw) == 1
+    assert ("head.weight" in all_names) is not tie
+    assert (model.head.weight is model.embed.weight) is tie
 
 
-def test_muon_split_difftransformer():
-    model = tiny_model(DiffTransformer)
+@pytest.mark.parametrize("tie", [True, False])
+def test_muon_split_difftransformer(tie):
+    model = tiny_model(DiffTransformer, tie_word_embeddings=tie)
     muon, adamw = muon_param_split(model)
     expected_muon = {
         f"layers.{i}.{n}.weight"
@@ -139,6 +150,8 @@ def test_muon_split_difftransformer():
     all_names = {n for n, _ in model.named_parameters()}
     assert names(model, adamw) == all_names - expected_muon
     assert all(p.ndim == 2 for p in muon)
+    assert sum(p is model.head.weight for p in adamw) == 1
+    assert (model.head.weight is model.token_emb.weight) is tie
 
 
 def test_muon_flags_match_split():
@@ -204,12 +217,21 @@ def effective_lrs(optimizer):
     return [(g["lr"],) for g in optimizer.param_groups]
 
 
+def base_lrs(config):
+    """Per-group base rates: (Muon path, AdamW path) for Muon, (lr,) otherwise."""
+    if config.optimizer == "muon":
+        return (config.muon_learning_rate, config.learning_rate)
+    return (config.learning_rate,)
+
+
 @pytest.mark.parametrize("name", OPTIMIZER_CLASSES)
-def test_every_learning_rate_is_config_lr_and_follows_scheduler(name):
-    model = tiny_model(GPTModel, optimizer=name)
+def test_learning_rates_follow_config_and_scheduler(name):
+    # muon_learning_rate differs from both defaults, so a mix-up shows
+    model = tiny_model(GPTModel, optimizer=name, muon_learning_rate=0.05)
     optimizer = build_optimizer(model, model.config)
-    lr = model.config.learning_rate
-    assert all(x == lr for lrs in effective_lrs(optimizer) for x in lrs)
+    base = base_lrs(model.config)
+    for lrs in effective_lrs(optimizer):
+        assert lrs == pytest.approx(base, rel=1e-12)
 
     scheduler = get_scheduler(
         "linear", optimizer, num_warmup_steps=2, num_training_steps=6
@@ -217,9 +239,100 @@ def test_every_learning_rate_is_config_lr_and_follows_scheduler(name):
     factors = [0.0, 0.5, 1.0, 0.75, 0.5, 0.25, 0.0]  # warmup 2, linear decay to 6
     for step, factor in enumerate(factors):
         for lrs in effective_lrs(optimizer):
-            assert lrs == pytest.approx((lr * factor,) * len(lrs)), (step, lrs)
+            expected = tuple(b * factor for b in base)
+            assert lrs == pytest.approx(expected, rel=1e-12, abs=1e-15), (step, lrs)
         optimizer.step()
         scheduler.step()
+
+
+def test_muon_default_rates_and_paths():
+    """At the defaults Muon steps hidden matrices at 0.02, the rest at 6e-4."""
+    assert Config().muon_learning_rate == 0.02
+    assert Config().learning_rate == 6e-4
+    model = tiny_model(
+        GPTModel, optimizer="muon", learning_rate=6e-4, muon_learning_rate=0.02
+    )
+    optimizer = build_optimizer(model, model.config)
+    assert len(optimizer.param_groups) == 2  # decayed / non-decayed AdamW params
+    for g in optimizer.param_groups:
+        assert g["lr"] == 0.02
+        assert g["adamw_lr_ratio"] * g["lr"] == pytest.approx(6e-4, rel=1e-12)
+
+
+def test_muon_rates_reach_the_parameters():
+    """One step with zero momentum history: Muon-path update size scales with
+    muon_learning_rate, AdamW-path update size with learning_rate, independently."""
+
+    def deltas(lr, muon_lr):
+        model = tiny_model(
+            GPTModel,
+            optimizer="muon",
+            learning_rate=lr,
+            muon_learning_rate=muon_lr,
+            weight_decay=0.0,
+        )
+        optimizer = build_optimizer(model, model.config)
+        before = copy.deepcopy(model)
+        model(data())["loss"].backward()
+        optimizer.step()
+        return {
+            n: (p - p0).abs().max().item()
+            for (n, p), (_, p0) in zip(
+                model.named_parameters(), before.named_parameters()
+            )
+        }
+
+    base = deltas(1e-3, 0.02)
+    more_muon = deltas(1e-3, 0.04)
+    more_adamw = deltas(2e-3, 0.02)
+    reference = tiny_model(GPTModel)
+    muon_names = names(reference, muon_param_split(reference)[0])
+    assert muon_names  # both paths are exercised
+    for n, d in base.items():
+        assert d > 0, n
+        if n in muon_names:
+            assert more_muon[n] == pytest.approx(2 * d, rel=1e-2), n
+            assert more_adamw[n] == pytest.approx(d, rel=1e-2), n
+        else:
+            assert more_adamw[n] == pytest.approx(2 * d, rel=1e-2), n
+            assert more_muon[n] == pytest.approx(d, rel=1e-2), n
+
+
+@pytest.mark.parametrize("name", ["adamw", "grokadamw"])
+def test_muon_learning_rate_has_no_effect_on_other_optimizers(name):
+    groups = []
+    for muon_lr in (0.02, 0.5):
+        model = tiny_model(GPTModel, optimizer=name, muon_learning_rate=muon_lr)
+        optimizer = build_optimizer(model, model.config)
+        groups.append(
+            [
+                {k: v for k, v in g.items() if k != "params"}
+                for g in optimizer.param_groups
+            ]
+        )
+    assert groups[0] == groups[1]
+    assert all(g["lr"] == model.config.learning_rate for g in groups[0])
+
+
+@pytest.mark.parametrize("name", OPTIMIZER_CLASSES)
+def test_current_learning_rates_names_each_path(name):
+    model = tiny_model(GPTModel, optimizer=name, muon_learning_rate=0.05)
+    optimizer = build_optimizer(model, model.config)
+    scheduler = get_scheduler(
+        "linear", optimizer, num_warmup_steps=2, num_training_steps=6
+    )
+    optimizer.step()
+    scheduler.step()  # warmup factor 0.5
+    wrapped = Accelerator(cpu=True).prepare(optimizer)
+    assert isinstance(wrapped, AcceleratedOptimizer)
+    for opt in (optimizer, wrapped):
+        rates = current_learning_rates(opt)
+        if name == "muon":
+            assert set(rates) == {"learning_rate", "muon_learning_rate"}
+            assert rates["muon_learning_rate"] == pytest.approx(0.5 * 0.05)
+        else:
+            assert set(rates) == {"learning_rate"}
+        assert rates["learning_rate"] == pytest.approx(0.5 * 3e-3)
 
 
 ##########################################

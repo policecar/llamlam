@@ -131,38 +131,67 @@ def test_layer_norm(model):
         ), "LayerNorm output std is not close to one"
 
 
-def test_weight_initialization():
-    """Parameters follow the init scheme in llamlam/model.py (alpha = 0.5).
+RESIDUAL_PROJECTIONS = (".context.out_proj.weight", ".feedforward.2.weight")
 
-    embed ~ N(0, (3.3 alpha)^2), head ~ N(0, (alpha / d)^2),
-    attention and feed-forward weights ~ N(0, alpha^2 / d) for d = dim_embd,
-    norm gains = 1, biases = 0, pos_embed = 0.
+
+@pytest.mark.parametrize("init_std", [0.02, 0.05])
+@pytest.mark.parametrize("tie", [True, False])
+def test_weight_initialization(init_std, tie):
+    """Parameters follow the GPT-2-style scheme in llamlam/model.py (DEC-002).
+
+    Every weight (embed, pos_embed, qkv, feed-forward, untied head) ~ N(0, s^2)
+    for s = init_std; the residual output projections (attention out_proj, last
+    feed-forward linear) ~ N(0, s^2 / (2 * n_layers)); biases = 0; norm gains = 1.
+    Sizes keep every tensor at >= 4096 entries, so the std band (6 %) is >= 5
+    standard errors wide and the residual scale (1/sqrt(6) here) is unmistakable.
     """
-    model = GPTModel(small_config(bias=True))  # bias=True covers the bias branch
-    alpha, d = 0.5, model.config.dim_embd
-    expected_std = {
-        "embed.weight": 3.3 * alpha,
-        "head.weight": alpha / d,
-    }
+    # bias=True covers the bias branch
+    config = Config(
+        max_seq_length=64,
+        vocab_size=256,
+        n_layers=3,
+        n_heads=4,
+        dim_head=16,
+        bias=True,
+        init_std=init_std,
+        tie_word_embeddings=tie,
+    )
+    model = GPTModel(config)
+    residual_std = init_std / (2 * config.n_layers) ** 0.5
 
+    seen = set()
     for name, param in model.named_parameters():
+        seen.add(name)
         is_norm = ".norm_" in name or name.startswith("ln_f.")
         if name.endswith(".bias"):
             assert torch.all(param == 0), f"Bias {name} is not zero"
         elif is_norm:
             assert torch.all(param == 1), f"Norm gain {name} is not one"
-        elif name == "pos_embed":
-            assert torch.all(param == 0), "pos_embed is not zero"
         else:
-            assert name.endswith(".weight"), f"Unexpected parameter {name}"
-            std = expected_std.get(name, alpha / d**0.5)
+            assert name == "pos_embed" or name.endswith(
+                ".weight"
+            ), f"Unexpected parameter {name}"
+            std = residual_std if name.endswith(RESIDUAL_PROJECTIONS) else init_std
             assert param.std().item() == pytest.approx(
-                std, rel=0.15
-            ), f"Weight {name} has std {param.std().item():.4f}, expected {std:.4f}"
+                std, rel=0.06
+            ), f"Weight {name} has std {param.std().item():.5f}, expected {std:.5f}"
             # mean within 5 standard errors of zero
             assert (
                 param.mean().abs() < 5 * std / param.numel() ** 0.5
             ), f"Weight {name} has high mean"
+
+    # every class of parameter was checked; the head is the embedding iff tied
+    assert {"embed.weight", "pos_embed", "ln_f.weight", "ln_f.bias"} <= seen
+    for i in range(config.n_layers):
+        for suffix in RESIDUAL_PROJECTIONS + (
+            ".context.qkv_proj.weight",
+            ".feedforward.0.weight",
+            ".feedforward.0.bias",
+            ".norm_1.weight",
+        ):
+            assert f"blocks.{i}{suffix}" in seen
+    assert ("head.weight" in seen) is not tie
+    assert (model.head.weight is model.embed.weight) is tie
 
 
 def test_overfitting_small_dataset(model):

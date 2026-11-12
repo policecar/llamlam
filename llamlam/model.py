@@ -106,7 +106,7 @@ class LayerNorm(nn.Module):
 
 
 class Context(nn.Module):
-    def __init__(self, dim_embd, n_heads, alpha=0.5):
+    def __init__(self, dim_embd, n_heads):
         super().__init__()
 
         self.dim_embd = dim_embd
@@ -116,23 +116,17 @@ class Context(nn.Module):
             self.dim_head * n_heads == dim_embd
         ), "dim_head should be dim_embd // n_heads because efficiency"
 
-        # Scale factor for dot product attention
-        # see Attention is All You Need paper (Vaswani et al., 2017), page 4:
+        # Scale factor for dot product attention, used by every attention call
+        # below; see Attention is All You Need paper (Vaswani et al., 2017), page 4:
         # "We suspect that for large values of d_k, the dot products grow large in magnitude,
         #  pushing the softmax function into regions where it has extremely small gradients.
         #  To counteract this effect, we scale the dot products by 1 / sqrt(d_k)."
-        self.scaling = self.dim_head**-0.5  # not used
+        # (µP would use 1 / d_k instead, see GPTModel DEC-002.)
+        self.scaling = self.dim_head**-0.5
 
+        # Weights are initialised by GPTModel._init_weights
         self.qkv_proj = nn.Linear(dim_embd, 3 * dim_embd, bias=False)
         self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
-
-        # Initialization for linear layers
-        for name, param in self.qkv_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
-        for name, param in self.out_proj.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=alpha * (1 / dim_embd) ** 0.5)
 
     def forward(self, x, mask=None, past_kv=None, use_cache=False):
         """
@@ -164,7 +158,7 @@ class Context(nn.Module):
 
         if past_kv is None:
             attn_output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=True, scale=1 / self.dim_head
+                q, k, v, attn_mask=mask, is_causal=True, scale=self.scaling
             )
         else:
             if mask is not None:
@@ -178,7 +172,7 @@ class Context(nn.Module):
                 seq_length, k.size(2), dtype=torch.bool, device=x.device
             ).tril(diagonal=past_len)
             attn_output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=cross_mask, scale=1 / self.dim_head
+                q, k, v, attn_mask=cross_mask, scale=self.scaling
             )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size, seq_length, self.dim_embd
@@ -199,12 +193,7 @@ class Block(nn.Module):
             nn.Linear(config.dim_embd, 4 * config.dim_embd, bias=config.bias),
             GELU(),
             nn.Linear(4 * config.dim_embd, config.dim_embd, bias=config.bias),
-        )
-        for name, param in self.feedforward.named_parameters():
-            if "weight" in name:
-                init.normal_(param, mean=0, std=0.5 * (1 / config.dim_embd) ** 0.5)
-            else:
-                init.zeros_(param)
+        )  # weights and biases are initialised by GPTModel._init_weights
 
         # Alternative implementation using Conv1D
         # self.feedforward = nn.Sequential(
@@ -233,7 +222,27 @@ class Block(nn.Module):
 
 
 class GPTModel(nn.Module):
-    def __init__(self, config, alpha=0.5):
+    """
+    GPT-2-style decoder.
+
+    @decision DEC-002: Standard parametrisation (SP): 1/sqrt(dim_head) attention,
+    weights ~ N(0, init_std), residual projections (out_proj, feedforward[2]) by a
+    further 1/sqrt(2 * n_layers), biases 0, norm gains 1; tie_word_embeddings
+    makes the head share embed's matrix.
+    @rationale: The min-max-gpt scheme used before (1/dim_head attention, head std
+    alpha/dim_embd, embedding std 3.3 * alpha, block std alpha/sqrt(dim_embd),
+    alpha = 0.5) was half of µP (maximal update parametrisation; Yang & Hu,
+    Tensor Programs IV; Yang et al., Tensor Programs V): µP's width-dependent
+    per-layer learning rates were never applied. Versus SP, µP scales attention
+    logits by 1/d not 1/sqrt(d), shrinks the output layer's init with width, and
+    for Adam uses LRs ~ 1/width for hidden and output weights, constant for input
+    embeddings. It buys hyperparameter transfer from narrow to wide models; it
+    costs per-layer LR groups, comparability with GPT-2-style baselines, and
+    fits weight tying badly. µP is a possible future option; design notes in
+    https://github.com/policecar/llamlam/pull/1 (`.context/extensions/`).
+    """
+
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.embed = nn.Embedding(config.vocab_size, config.dim_embd)
@@ -247,8 +256,21 @@ class GPTModel(nn.Module):
         self.bias = config.bias
         self.dropout = config.dropout
 
-        init.normal_(self.head.weight, mean=0, std=alpha * (1 / config.dim_embd))
-        init.normal_(self.embed.weight, mean=0, std=alpha * 3.3)
+        # GPT-2-style init (DEC-002); norms keep their ones/zeros
+        self.apply(self._init_weights)
+        init.normal_(self.pos_embed, mean=0.0, std=config.init_std)
+        residual_std = config.init_std / (2 * config.n_layers) ** 0.5
+        for block in self.blocks:
+            init.normal_(block.context.out_proj.weight, mean=0.0, std=residual_std)
+            init.normal_(block.feedforward[2].weight, mean=0.0, std=residual_std)
+        if config.tie_word_embeddings:
+            self.head.weight = self.embed.weight  # one matrix, embed's init
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            init.zeros_(module.bias)
 
     def forward(
         self,

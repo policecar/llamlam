@@ -370,14 +370,27 @@ def lrs(logged):
     return [(s, m["learning_rate"]) for s, m in logged if "learning_rate" in m]
 
 
+def embedding_of(model):
+    return model.embed if hasattr(model, "embed") else model.token_emb
+
+
 @pytest.mark.parametrize(
-    "model_type, optimizer",
-    [("gpt", "adamw"), ("diff", "adamw"), ("gpt", "muon"), ("diff", "grokadamw")],
+    "model_type, optimizer, tie",
+    [
+        ("gpt", "adamw", True),
+        ("diff", "adamw", True),
+        ("gpt", "muon", True),
+        ("diff", "grokadamw", True),
+        ("gpt", "adamw", False),
+        ("diff", "muon", False),
+    ],
 )
 def test_interrupted_and_resumed_run_matches_uninterrupted(
-    tmp_path, model_type, optimizer
+    tmp_path, model_type, optimizer, tie
 ):
-    config = e2e_config(model_type=model_type, optimizer=optimizer)
+    config = e2e_config(
+        model_type=model_type, optimizer=optimizer, tie_word_embeddings=tie
+    )
     full = train_run(config, tmp_path / "full")
 
     run_dir = tmp_path / "resumed"
@@ -418,6 +431,13 @@ def test_interrupted_and_resumed_run_matches_uninterrupted(
         second["model"].named_parameters(), full["model"].named_parameters()
     ):
         torch.testing.assert_close(p, q, rtol=1e-5, atol=1e-6, msg=n)
+    # the resumed head is still the embedding matrix (or still separate)
+    for run in (full, second):
+        model = run["model"]
+        assert (model.head.weight is embedding_of(model).weight) is tie
+    torch.testing.assert_close(
+        second["model"].head.weight, full["model"].head.weight, rtol=1e-5, atol=1e-6
+    )
     # and the same kept-best checkpoints
     assert ckpt_dirs(run_dir) == ckpt_dirs(tmp_path / "full")
     assert json.loads((run_dir / "last" / "progress.json").read_text())["epoch"] == 2

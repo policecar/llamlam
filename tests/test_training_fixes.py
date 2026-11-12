@@ -34,7 +34,7 @@ from llamlam.train import (
     run_training,
     sample_text,
 )
-from llamlam.utils import evaluate, get_grouped_params
+from llamlam.utils import build_optimizer, evaluate, get_grouped_params
 
 SEQ_LEN = 12
 
@@ -383,8 +383,10 @@ def test_checkpoint_manager_keeps_best_separate_from_last(tmp_path):
 
     best = load_file(best_dir / "model.safetensors")
     last = load_file(tmp_path / "last" / "model.safetensors")
-    assert torch.all(best["head.weight"] == 1.0)
-    assert torch.all(last["head.weight"] == 3.0)
+    # the head is tied (default), so safetensors stores it once, as token_emb.weight
+    assert "head.weight" not in best and "head.weight" not in last
+    assert torch.all(best["token_emb.weight"] == 1.0)
+    assert torch.all(last["token_emb.weight"] == 3.0)
     assert checkpoints.best == [(2.0, "ckpt_000002")]
     assert not (tmp_path / "ckpt_000001").exists()  # pruned to keep_k=1
 
@@ -431,8 +433,10 @@ def decay_by_name(model, weight_decay=0.1):
     return {n: by_id[id(p)] for n, p in model.named_parameters()}
 
 
-def test_gpt_weight_decay_groups():
-    decay = decay_by_name(tiny_model(tiny_config(), GPTModel))
+@pytest.mark.parametrize("tie", [True, False])
+def test_gpt_weight_decay_groups(tie):
+    model = tiny_model(tiny_config(tie_word_embeddings=tie), GPTModel)
+    decay = decay_by_name(model)
     for name, wd in decay.items():
         no_decay = (
             name.endswith(".bias")
@@ -444,12 +448,19 @@ def test_gpt_weight_decay_groups():
         assert wd == (0.0 if no_decay else 0.1), name
     assert decay["blocks.0.norm_1.weight"] == 0.0
     assert decay["ln_f.weight"] == 0.0
-    assert decay["embed.weight"] == decay["head.weight"] == 0.1
+    assert decay["embed.weight"] == 0.1
+    if tie:  # the shared matrix is one parameter, decayed once under embed.weight
+        assert model.head.weight is model.embed.weight
+        assert "head.weight" not in decay
+    else:
+        assert decay["head.weight"] == 0.1
     assert decay["blocks.0.context.qkv_proj.weight"] == 0.1
 
 
-def test_difftransformer_weight_decay_groups():
-    decay = decay_by_name(tiny_model(tiny_config(), DiffTransformer))
+@pytest.mark.parametrize("tie", [True, False])
+def test_difftransformer_weight_decay_groups(tie):
+    model = tiny_model(tiny_config(tie_word_embeddings=tie), DiffTransformer)
+    decay = decay_by_name(model)
     for name, wd in decay.items():
         no_decay = (
             name.endswith(".bias")
@@ -462,7 +473,12 @@ def test_difftransformer_weight_decay_groups():
         assert decay[f"layers.0.attn.{name}"] == 0.0
     assert decay["layers.0.norm1.scale"] == decay["norm.scale"] == 0.0
     assert decay["token_emb.weight"] == decay["pos_emb.weight"] == 0.1
-    assert decay["layers.0.attn.W_q.weight"] == decay["head.weight"] == 0.1
+    assert decay["layers.0.attn.W_q.weight"] == 0.1
+    if tie:  # the shared matrix is one parameter, decayed once under token_emb
+        assert model.head.weight is model.token_emb.weight
+        assert "head.weight" not in decay
+    else:
+        assert decay["head.weight"] == 0.1
 
 
 def test_grouped_params_handle_tied_and_frozen_weights():
@@ -631,3 +647,37 @@ def test_prepared_scheduler_ends_on_last_optimizer_step(tmp_path, accelerator):
     assert scheduler.scheduler.last_epoch == counts[1]
     assert lrs[-1] == 0.0
     assert lrs[-2] > 0.0  # after the 5th of 6 optimizer steps
+
+
+@pytest.mark.parametrize("name", ["adamw", "muon"])
+def test_logged_learning_rates_name_each_optimizer_path(tmp_path, accelerator, name):
+    # learning_rate is always the config.learning_rate path (all of AdamW, Muon's
+    # AdamW path); Muon also logs muon_learning_rate, its orthogonalised path
+    config = tiny_config(
+        optimizer=name, n_epochs=1, learning_rate=1e-3, muon_learning_rate=0.05
+    )
+    model = tiny_model(config)
+    base_optimizer = build_optimizer(model, config)
+    loader = DataLoader(make_batches(4, config), batch_size=None)
+    model, optimizer, loader = accelerator.prepare(model, base_optimizer, loader)
+    scheduler = accelerator.prepare(get_scheduler("linear", base_optimizer, 2, 4))
+    logged = []
+    run_training(
+        model,
+        optimizer,
+        scheduler,
+        loader,
+        make_batches(1, config),
+        accelerator,
+        config,
+        tmp_path,
+        log=lambda m, step=None: logged.append(m) if "train_loss" in m else None,
+    )
+    factors = [0.5, 1.0, 0.5, 0.0]  # after optimizer steps 1..4: warmup 2, total 4
+    assert len(logged) == len(factors)
+    for metrics, factor in zip(logged, factors):
+        assert metrics["learning_rate"] == pytest.approx(1e-3 * factor)
+        if name == "muon":
+            assert metrics["muon_learning_rate"] == pytest.approx(0.05 * factor)
+        else:
+            assert "muon_learning_rate" not in metrics

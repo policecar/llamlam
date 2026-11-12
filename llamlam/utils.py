@@ -161,6 +161,12 @@ def muon_param_split(model):
 #   parameters, which decays norm gains and biases; here those go into a second
 #   Muon param group with adamw_wd=0, matching AdamW/GrokAdamW. Muon stores its
 #   AdamW lr as adamw_lr / lr times group["lr"], so a LambdaLR scales both paths.
+# @decision DEC-004: Muon's orthogonalised updates use config.muon_learning_rate
+#   (default 0.02, Muon's documented default), its AdamW path config.learning_rate
+# @rationale: the orthogonalised update has spectral norm ~lr, a different scale
+#   from an Adam step, so one shared rate left Muon ~33x below its recommended
+#   0.02 at the default 6e-4. group["lr"] holds the Muon rate and adamw_lr_ratio
+#   = learning_rate / muon_learning_rate, so the schedule still scales both.
 def build_optimizer(model, config):
     """
     Construct the optimizer named by config.optimizer ("adamw", "muon", "grokadamw").
@@ -169,9 +175,11 @@ def build_optimizer(model, config):
     - grokadamw: llamlam.opt.GrokAdamW over the same groups; its per-tensor
       gradient clipping uses config.gradient_clipping (0 or None disables it).
     - muon: llamlam.opt.Muon with muon_param_split(model); Muon steps use
-      lr=config.learning_rate (no weight decay, as in Muon itself), the AdamW path
-      also lr=config.learning_rate, with config.weight_decay on the Linear /
-      Embedding weights it holds (embeddings, head) and 0 on the rest.
+      lr=config.muon_learning_rate (no weight decay, as in Muon itself), the
+      AdamW path lr=config.learning_rate, with config.weight_decay on the
+      Linear / Embedding weights it holds (embeddings, head) and 0 on the rest.
+
+    config.muon_learning_rate is read only for "muon".
 
     Raises ValueError for an unknown optimizer name.
     """
@@ -202,7 +210,7 @@ def build_optimizer(model, config):
     adamw_no_decay = [p for p in adamw_params if id(p) not in decay_ids]
     optimizer = Muon(
         muon_params,
-        lr=lr,
+        lr=config.muon_learning_rate,
         adamw_params=adamw_decay,
         adamw_lr=lr,
         adamw_wd=weight_decay,
@@ -214,3 +222,22 @@ def build_optimizer(model, config):
         for p in adamw_no_decay:
             optimizer.state[p]["use_muon"] = False
     return optimizer
+
+
+def current_learning_rates(optimizer):
+    """
+    The learning rates in effect now, for logging (the scheduler's factor included).
+
+    "learning_rate" is always the rate of the parameters configured by
+    config.learning_rate: every parameter for AdamW/GrokAdamW, Muon's AdamW path
+    (embeddings, head, norms, biases) for Muon. Muon adds "muon_learning_rate",
+    the rate of its orthogonalised updates. `optimizer` may be wrapped by Accelerate.
+    """
+    base = getattr(optimizer, "optimizer", optimizer)  # AcceleratedOptimizer
+    group = base.param_groups[0]
+    if isinstance(base, Muon):
+        return {
+            "learning_rate": group["adamw_lr_ratio"] * group["lr"],
+            "muon_learning_rate": group["lr"],
+        }
+    return {"learning_rate": group["lr"]}

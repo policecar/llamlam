@@ -97,10 +97,16 @@ def heldout_data():
 
 @pytest.fixture(scope="module")
 def trained_model():
-    """A model briefly trained (40 Adam steps) on the Markov training data."""
+    """A model briefly trained (120 Adam steps) on the Markov training data.
+
+    The default config ties embedding and head. At this width (dim_embd 16,
+    vocab 100) that slows learning the next-token permutation: after 40 steps
+    held-out accuracy was 0.78-0.81 over 4 seeds (untied: 0.91, the Bayes
+    optimum, on all of them); after 120 steps it is 0.87-0.90 over 5 seeds.
+    """
     torch.manual_seed(42)
     model = GPTModel(make_config())
-    return train(model, markov_batches(n_batches=4, seed=0), epochs=10, lr=1e-2)
+    return train(model, markov_batches(n_batches=4, seed=0), epochs=30, lr=1e-2)
 
 
 class UniformBaseline(nn.Module):

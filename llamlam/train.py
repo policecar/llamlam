@@ -28,7 +28,12 @@ from llamlam.data import DataCollator, drop_short_examples, train_val_split
 
 from llamlam.difftransformer import DiffTransformer
 from llamlam.model import GPTModel
-from llamlam.utils import build_optimizer, evaluate, set_seed
+from llamlam.utils import (
+    build_optimizer,
+    current_learning_rates,
+    evaluate,
+    set_seed,
+)
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -84,7 +89,19 @@ def parse_args(argv=None):
         type=int,
         help="Number of steps between evaluations",
     )
-    parser.add_argument("--learning_rate", type=float, help="Learning rate")
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        help="Learning rate (with --optimizer muon: of Muon's AdamW path, i.e. "
+        "embeddings, head, norms and biases)",
+    )
+    parser.add_argument(
+        "--muon_learning_rate",
+        type=float,
+        help="Only with --optimizer muon (an error otherwise): learning rate of "
+        "Muon's orthogonalised updates of the hidden weight matrices "
+        f"(default: {Config().muon_learning_rate})",
+    )
     parser.add_argument("--weight_decay", type=float, help="Weight decay")
     parser.add_argument(
         "--lr_scheduler_type",
@@ -138,14 +155,25 @@ def apply_overrides(config, overrides):
 
 
 def build_config(args, config=None):
-    """Default (or given) Config with every non-None CLI value applied."""
+    """
+    Default (or given) Config with every non-None CLI value applied.
+
+    Raises ValueError for --muon_learning_rate without --optimizer muon: no
+    other optimizer reads it, so accepting it would suggest an effect it lacks.
+    """
     config = Config() if config is None else config
     overrides = {
         name: value
         for name, value in vars(args).items()
         if name not in RUN_OPTIONS and value is not None
     }
-    return apply_overrides(config, overrides)
+    config = apply_overrides(config, overrides)
+    if "muon_learning_rate" in overrides and config.optimizer != "muon":
+        raise ValueError(
+            f"--muon_learning_rate only applies to --optimizer muon, "
+            f"not {config.optimizer!r}; use --learning_rate"
+        )
+    return config
 
 
 def resolve_run_dir(args):
@@ -328,10 +356,13 @@ def run_training(
         best_val_loss = progress["best_val_loss"]
         if Path(resume_dir).resolve().parent == Path(run_dir).resolve():
             checkpoints.restore(progress)
+        rates = ", ".join(
+            f"{name} {lr:.3e}" for name, lr in current_learning_rates(optimizer).items()
+        )
         logger.info(
             f"Resumed from {resume_dir}: starting epoch {start_epoch}, step "
-            f"{global_step}, {n_optimizer_steps} optimizer steps, LR "
-            f"{lr_scheduler.get_last_lr()[0]:.3e}, kept best {checkpoints.best}"
+            f"{global_step}, {n_optimizer_steps} optimizer steps, {rates}, "
+            f"kept best {checkpoints.best}"
         )
         if start_epoch >= config.n_epochs:
             logger.warning(
@@ -395,7 +426,7 @@ def run_training(
             log(
                 {
                     "train_loss": loss.item(),
-                    "learning_rate": lr_scheduler.get_last_lr()[0],
+                    **current_learning_rates(optimizer),
                     "epoch": epoch,
                 },
                 step=global_step,

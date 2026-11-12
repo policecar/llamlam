@@ -50,6 +50,9 @@ class Config:
                                             # GPT-2 used True; here we default to False which is slightly faster, better
     dropout: float = 0.1                    # dropout rate
     # qkv_bias: bool = True                 # use bias in qkv projection
+    init_std: float = 0.02                  # GPTModel weight init std (GPT-2 style), see model.py
+    tie_word_embeddings: bool = True        # share the input embedding matrix with the output head
+                                            # (both models)
 
     # Training config
     optimizer: str = "adamw"                # "adamw", "muon" or "grokadamw", see utils.build_optimizer
@@ -57,6 +60,9 @@ class Config:
     n_epochs: int = 3
     eval_steps: int = 200
     learning_rate: float = 6e-4  # [6e-4, 6e-5]
+    muon_learning_rate: float = 0.02        # optimizer="muon" only: step size of Muon's
+                                            # orthogonalised updates (hidden weight matrices);
+                                            # its AdamW path uses learning_rate
     batch_size: int = 4  # 32
     gradient_accumulation_steps: int = 8
     weight_decay: float = 0.01              # applied to nn.Linear / nn.Embedding weights only,

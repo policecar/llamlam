@@ -36,8 +36,8 @@ def build(model_cls, seed=0, **overrides):
     torch.manual_seed(seed)
     model = model_cls(Config(**kwargs))
     if model_cls is GPTModel:
-        # pos_embed is zero-initialised; randomise it so positions matter and a
-        # wrong cache offset changes the logits.
+        # pos_embed is initialised small (std init_std); enlarge it so positions
+        # matter and a wrong cache offset changes the logits.
         with torch.no_grad():
             model.pos_embed.normal_(0, 1)
     model.eval()

@@ -341,6 +341,14 @@ class DiffTransformer(nn.Module):
         # Initialize weights (optional but recommended)
         self._reset_parameters()
 
+        # @decision DEC-004: config.tie_word_embeddings shares token_emb.weight
+        # with head.weight, as in GPTModel; no init change.
+        # @rationale: both are (vocab_size, dim_embd) with the same fan-in and
+        # fan-out, so xavier_uniform gives them the same distribution; the shared
+        # matrix keeps token_emb's init and the head's draw is dropped.
+        if self.config.tie_word_embeddings:
+            self.head.weight = self.token_emb.weight
+
     def _reset_parameters(self):
         """
         Initialize parameters for improved training stability.
