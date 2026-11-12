@@ -60,8 +60,9 @@ logger = logging.getLogger(__name__)
 
 LAST_DIR = "last"
 PROGRESS_FILE = "progress.json"
-# accelerate 1.0.1's save_state keeps the CPU/CUDA/XPU/MLU/XLA RNG states but not
-# the MPS one, so dropout on MPS would draw different masks after a resume
+# accelerate's save_state (1.0.1 and 1.15.0) keeps the CPU, CUDA, XPU, ... RNG
+# states but not the MPS one, so dropout on MPS would draw different masks after a
+# resume
 MPS_RNG_FILE = "mps_rng_state.pt"
 
 

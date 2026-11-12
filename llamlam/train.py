@@ -282,16 +282,33 @@ def build_model(config):
 #   torch's seed at prepare() (config.seed) + k, k coming from set_epoch also in a
 #   resumed process: epoch k's order depends on (seed, k) only, on any number of
 #   processes. (So seed s's epoch k+1 is seed s+1's epoch k.)
+#
+# @decision DEC-005: refuse fp16 when the Accelerator's device is the CPU
+# @rationale: accelerate 1.15.0 enables neither autocast nor a gradient scaler for
+#   fp16 on CPU (Accelerator.__init__ skips native_amp when device.type is "cpu"),
+#   so such a run silently trains in float32. The check reads accelerator.device,
+#   which Accelerate decides itself (cpu=True, ACCELERATE_USE_CPU,
+#   ACCELERATE_TORCH_DEVICE, else the detected accelerator), instead of guessing.
 def build_accelerator(config, **kwargs):
-    """Accelerator with config.mixed_precision; raises ValueError for unknown modes."""
+    """
+    Accelerator with config.mixed_precision; raises ValueError for unknown modes
+    and for fp16 on a CPU device, where it would do nothing.
+    """
     mixed_precision = check_choice(
         "mixed_precision", config.mixed_precision, MIXED_PRECISION_MODES
     )
-    return Accelerator(
+    accelerator = Accelerator(
         mixed_precision=mixed_precision,
         dataloader_config=DataLoaderConfiguration(use_seedable_sampler=True),
         **kwargs,
     )
+    if mixed_precision == "fp16" and accelerator.device.type == "cpu":
+        raise ValueError(
+            "--mixed_precision fp16 does nothing on the CPU (Accelerate enables "
+            "neither autocast nor a gradient scaler there, training would stay "
+            "float32); use bf16 or no on CPU"
+        )
+    return accelerator
 
 
 ##########################################
@@ -324,14 +341,15 @@ def num_training_steps(n_epochs, n_micro_batches, accum):
 # @decision DEC-002: build the LR scheduler after accelerator.prepare, from the
 #   sharded train loader's length, with warmup and total multiplied by
 #   num_processes (unless split_batches)
-# @rationale: accelerate 1.0.1's AcceleratedScheduler.step (scheduler.py) advances
-#   the wrapped scheduler num_processes times per call when split_batches is False,
-#   and once when it is True. Each process takes num_training_steps(...) optimizer
-#   steps over its own shard, so scaling both counts by that factor makes the
-#   schedule, measured in optimizer steps, identical to the single-process one and
-#   ends it exactly on the last optimizer step. Assumes step_scheduler_with_optimizer
-#   (the Accelerator default) and no accelerator.accumulate (sync_gradients stays
-#   True, so every step() call advances the schedule).
+# @rationale: accelerate's AcceleratedScheduler.step (scheduler.py; identical in
+#   1.0.1 and 1.15.0) advances the wrapped scheduler num_processes times per call
+#   when split_batches is False, and once when it is True. Each process takes
+#   num_training_steps(...) optimizer steps over its own shard, so scaling both
+#   counts by that factor makes the schedule, measured in optimizer steps,
+#   identical to the single-process one and ends it exactly on the last optimizer
+#   step. Assumes step_scheduler_with_optimizer (the Accelerator default) and no
+#   accelerator.accumulate (sync_gradients stays True, so every step() call
+#   advances the schedule).
 
 
 def lr_schedule_steps(
@@ -564,23 +582,25 @@ def main(argv=None):
     logger.info(f"Arguments parsed: {vars(args)}")
 
     # Resolve the run and resume directories and the config; a resume reads and
-    # checks its checkpoint here, so a refused one raises before anything is written
+    # checks its checkpoint here, and build_accelerator checks the precision
+    # against the device, so a refused run raises before anything is written
     run_name, output_dir = resolve_run_dir(args)
     resume_dir = resolve_resume_dir(output_dir, args.resume_from)
     if resume_dir is None:
         config = build_config(args)
     else:
         config = resume_config(args, read_resumable_progress(resume_dir), resume_dir)
-    os.makedirs(output_dir, exist_ok=True)
-    logger.info(f"Run directory: {output_dir}")
-    if resume_dir is not None:
-        logger.info(f"Resuming from: {resume_dir}")
 
     # Set seed
     set_seed(seed=config.seed)
     logger.info(f"Using seed: {config.seed}")
 
     accelerator = build_accelerator(config)
+
+    os.makedirs(output_dir, exist_ok=True)
+    logger.info(f"Run directory: {output_dir}")
+    if resume_dir is not None:
+        logger.info(f"Resuming from: {resume_dir}")
 
     ##########################################
     # Initialize tokenizer & some

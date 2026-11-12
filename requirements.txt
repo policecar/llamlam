@@ -1,4 +1,4 @@
-accelerate==1.0.1
+accelerate==1.15.0
 datasets==3.0.2
 deepspeed==0.15.3
 matplotlib==3.9.2
@@ -6,5 +6,5 @@ pre-commit==4.0.1
 pytest==8.3.3
 ruff==0.7.3
 transformers==4.46.2
-torch==2.5.0
+torch==2.15.0
 wandb==0.18.5
