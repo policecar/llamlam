@@ -118,8 +118,8 @@ def test_parameter_counts_at_default_config():
     expected = {
         (GPTModel, True): 124_337_664,
         (GPTModel, False): 162_935_040,
-        (DiffTransformer, True): 124_400_640,
-        (DiffTransformer, False): 162_998_016,
+        (DiffTransformer, True): 124_342_272,
+        (DiffTransformer, False): 162_939_648,
     }
     for (model_cls, tie), count in expected.items():
         with torch.device("meta"):

@@ -33,10 +33,11 @@ class SwiGLU(nn.Module):
     Taken from https://github.com/nanowell/Differential-Transformer-PyTorch
     """
 
-    def __init__(self, d_model):
+    def __init__(self, d_model, bias=True):
         """
         Args:
             d_model (int): Dimension of the input features.
+            bias (bool): Whether the three linear layers have biases.
         """
         super().__init__()
         # Hidden size 8/3 * d_model (Diff Transformer paper, after LLaMA): three
@@ -45,9 +46,9 @@ class SwiGLU(nn.Module):
         hidden = int(8 * d_model / 3)
         # Intermediate projection layers
         # Typically, SwiGLU splits the computation into two parts
-        self.WG = nn.Linear(d_model, hidden)
-        self.W1 = nn.Linear(d_model, hidden)
-        self.W2 = nn.Linear(hidden, d_model)
+        self.WG = nn.Linear(d_model, hidden, bias=bias)
+        self.W1 = nn.Linear(d_model, hidden, bias=bias)
+        self.W2 = nn.Linear(hidden, d_model, bias=bias)
 
     def forward(self, x):
         """
