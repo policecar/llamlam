@@ -227,8 +227,8 @@ class GPTModel(nn.Module):
 
     @decision DEC-002: Standard parametrisation (SP): 1/sqrt(dim_head) attention,
     weights ~ N(0, init_std), residual projections (out_proj, feedforward[2]) by a
-    further 1/sqrt(2 * n_layers), biases 0, norm gains 1; tie_word_embeddings
-    makes the head share embed's matrix.
+    further 1/sqrt(2 * n_layers), position embeddings, biases 0, norm gains 1;
+    tie_word_embeddings makes the head share embed's matrix.
     @rationale: The min-max-gpt scheme used before (1/dim_head attention, head std
     alpha/dim_embd, embedding std 3.3 * alpha, block std alpha/sqrt(dim_embd),
     alpha = 0.5) was half of µP (maximal update parametrisation; Yang & Hu,
@@ -256,9 +256,8 @@ class GPTModel(nn.Module):
         self.bias = config.bias
         self.dropout = config.dropout
 
-        # GPT-2-style init (DEC-002); norms keep their ones/zeros
+        # GPT-2-style init (DEC-002); norms keep their ones/zeros, pos_embed its zeros
         self.apply(self._init_weights)
-        init.normal_(self.pos_embed, mean=0.0, std=config.init_std)
         residual_std = config.init_std / (2 * config.n_layers) ** 0.5
         for block in self.blocks:
             init.normal_(block.context.out_proj.weight, mean=0.0, std=residual_std)

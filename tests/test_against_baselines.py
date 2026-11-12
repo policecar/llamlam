@@ -23,7 +23,7 @@ P_RULE = 0.9  # probability that the next token follows the rule
 MARGIN = 0.5  # nats by which the trained model must beat a baseline
 
 
-def make_config():
+def make_config(**overrides):
     return Config(
         max_seq_length=16,
         vocab_size=100,
@@ -31,6 +31,7 @@ def make_config():
         n_heads=2,
         dim_head=8,
         dropout=0.0,  # Disable dropout for testing
+        **overrides,
     )
 
 
@@ -97,16 +98,17 @@ def heldout_data():
 
 @pytest.fixture(scope="module")
 def trained_model():
-    """A model briefly trained (120 Adam steps) on the Markov training data.
+    """A model briefly trained (40 Adam steps) on the Markov training data.
 
-    The default config ties embedding and head. At this width (dim_embd 16,
-    vocab 100) that slows learning the next-token permutation: after 40 steps
-    held-out accuracy was 0.78-0.81 over 4 seeds (untied: 0.91, the Bayes
-    optimum, on all of them); after 120 steps it is 0.87-0.90 over 5 seeds.
+    Untied: at this width (dim_embd 16, vocab 100) tying embedding and head
+    slows learning the next-token permutation. After 40 steps held-out accuracy
+    was 0.785-0.823 tied (5 of 8 init seeds below the 0.8 threshold) and
+    0.906-0.910 untied (the Bayes optimum ~0.905). These tests are about the
+    model learning the data; tying is tested in tests/test_parametrisation.py.
     """
     torch.manual_seed(42)
-    model = GPTModel(make_config())
-    return train(model, markov_batches(n_batches=4, seed=0), epochs=30, lr=1e-2)
+    model = GPTModel(make_config(tie_word_embeddings=False))
+    return train(model, markov_batches(n_batches=4, seed=0), epochs=10, lr=1e-2)
 
 
 class UniformBaseline(nn.Module):

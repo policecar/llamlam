@@ -71,8 +71,8 @@ sequence fits in `max_seq_length`; past that, each step re-encodes the last
 Both models tie the input embedding to the output head (`tie_word_embeddings`,
 default on). `gpt` uses the standard GPT-2-style parametrisation: attention
 logits scaled by `1/sqrt(dim_head)`, weights ~ N(0, `init_std` = 0.02), residual
-output projections by a further `1/sqrt(2 * n_layers)` (`diff` keeps its Xavier
-init and `1/sqrt(d)` attention).
+output projections by a further `1/sqrt(2 * n_layers)`, position embeddings zero
+(`diff` keeps its Xavier init and `1/sqrt(d)` attention).
 
 Before, `gpt` used a scheme inherited from min-max-gpt (`1/dim_head` attention,
 head std `alpha / dim_embd`, embedding std `3.3 * alpha`, block std

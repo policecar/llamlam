@@ -35,30 +35,49 @@ def train_config():
 
 
 def test_weight_decay(det_model, train_config):
-    """Weight decay shrinks the decayed weights relative to training without it.
+    """Weight decay shrinks exactly the decayed weights, by lr * wd * weight.
 
-    Training on a fixed batch grows the weights, so the comparison is against an
-    identical run with weight_decay=0, using the repo's optimizer param groups.
+    One AdamW step with the repo's param groups from the same state, with and
+    without decay: the gradients and Adam update are identical, and decoupled
+    decay first scales each decayed weight by (1 - lr * wd). So every
+    Linear/Embedding weight ends lr * wd * its initial value lower, and every
+    other parameter is untouched by decay. (Comparing summed norms after 100
+    steps instead is chaotic: at wd 0.01 its sign varied with the seed.)
     """
     input_ids = torch.randint(0, 100, (4, 16))
     init_state = det_model.state_dict()
+    lr, wd = 1e-3, train_config.weight_decay
+    assert wd > 0
 
-    def decayed_norm_after_training(weight_decay):
+    def one_step(weight_decay):
         model = GPTModel(det_model.config)
         model.load_state_dict(init_state)
         groups = get_grouped_params(model, weight_decay=weight_decay)
-        optimizer = AdamW(groups, lr=1e-3)
-        for _ in range(100):
-            optimizer.zero_grad()
-            loss = model(input_ids)["loss"]
-            loss.backward()
-            optimizer.step()
-        return sum(p.norm().item() for p in groups[0]["params"])
+        decayed = {id(p) for p in groups[0]["params"]}
+        optimizer = AdamW(groups, lr=lr)
+        model(input_ids)["loss"].backward()
+        optimizer.step()
+        params = dict(model.named_parameters())
+        return params, {n for n, p in params.items() if id(p) in decayed}
 
-    assert train_config.weight_decay > 0
-    norm_without = decayed_norm_after_training(0.0)
-    norm_with = decayed_norm_after_training(train_config.weight_decay)
+    without, _ = one_step(0.0)
+    with_decay, decayed = one_step(wd)
 
+    assert {"embed.weight", "blocks.0.context.qkv_proj.weight"} <= decayed
+    assert "pos_embed" not in decayed and "ln_f.weight" not in decayed
+    for name, param in with_decay.items():
+        if name in decayed:
+            torch.testing.assert_close(
+                without[name] - param,
+                lr * wd * init_state[name],
+                rtol=0,
+                atol=1e-8,
+                msg=f"{name} not decayed by lr * wd * weight",
+            )
+        else:
+            assert torch.equal(param, without[name]), f"{name} was decayed"
+    norm_with = sum(with_decay[n].norm().item() for n in decayed)
+    norm_without = sum(without[n].norm().item() for n in decayed)
     assert norm_with < norm_without, "Weight decay did not reduce parameter norms"
 
 
@@ -139,9 +158,10 @@ RESIDUAL_PROJECTIONS = (".context.out_proj.weight", ".feedforward.2.weight")
 def test_weight_initialization(init_std, tie):
     """Parameters follow the GPT-2-style scheme in llamlam/model.py (DEC-002).
 
-    Every weight (embed, pos_embed, qkv, feed-forward, untied head) ~ N(0, s^2)
-    for s = init_std; the residual output projections (attention out_proj, last
-    feed-forward linear) ~ N(0, s^2 / (2 * n_layers)); biases = 0; norm gains = 1.
+    Every weight (embed, qkv, feed-forward, untied head) ~ N(0, s^2) for
+    s = init_std; the residual output projections (attention out_proj, last
+    feed-forward linear) ~ N(0, s^2 / (2 * n_layers)); pos_embed = 0; biases = 0;
+    norm gains = 1.
     Sizes keep every tensor at >= 4096 entries, so the std band (6 %) is >= 5
     standard errors wide and the residual scale (1/sqrt(6) here) is unmistakable.
     """
@@ -167,10 +187,10 @@ def test_weight_initialization(init_std, tie):
             assert torch.all(param == 0), f"Bias {name} is not zero"
         elif is_norm:
             assert torch.all(param == 1), f"Norm gain {name} is not one"
+        elif name == "pos_embed":
+            assert torch.all(param == 0), "pos_embed is not zero"
         else:
-            assert name == "pos_embed" or name.endswith(
-                ".weight"
-            ), f"Unexpected parameter {name}"
+            assert name.endswith(".weight"), f"Unexpected parameter {name}"
             std = residual_std if name.endswith(RESIDUAL_PROJECTIONS) else init_std
             assert param.std().item() == pytest.approx(
                 std, rel=0.06

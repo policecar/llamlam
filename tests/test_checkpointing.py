@@ -1,16 +1,20 @@
 """
 Checkpoints (llamlam.checkpoint): keep-k-best pruning, last/ round trip, resume
-directory resolution, main-process-only writes, and an interrupted-and-resumed
-run matching an uninterrupted one.
+directory resolution, main-process-only writes, an interrupted-and-resumed
+run matching an uninterrupted one, and saving a tied head without Accelerate's
+shared-tensor warning.
 """
 
 import json
+import logging
 import math
 from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 from accelerate import Accelerator
+from safetensors import safe_open
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 
@@ -31,6 +35,11 @@ from llamlam.train import (
 from llamlam.utils import build_optimizer
 
 
+class FakeHandle:
+    def remove(self):
+        pass
+
+
 class FakeAccelerator:
     """Stands in for accelerate.Accelerator: persists a single integer 'state'."""
 
@@ -44,6 +53,9 @@ class FakeAccelerator:
 
     def wait_for_everyone(self):
         pass
+
+    def register_save_state_pre_hook(self, hook):
+        return FakeHandle()  # save_state below never calls hooks
 
     def save_state(self, output_dir):
         self.saved_to.append(Path(output_dir).name)
@@ -480,3 +492,114 @@ def test_resume_counters_cover_every_progress_field(tmp_path):
         "resumable",
         "best_checkpoints",
     }
+
+
+##########################################
+# tied head: no "Removed shared tensor" warning on save
+##########################################
+
+SHARED_WARNING = "Removed shared tensor"
+
+
+def shared_tensor_warnings(caplog):
+    """The removed-tensor name sets Accelerate reported, one per warning."""
+    return [
+        r.getMessage().split("{")[1].split("}")[0]
+        for r in caplog.records
+        if r.name == "accelerate.utils.other" and SHARED_WARNING in r.getMessage()
+    ]
+
+
+def prepared(model_type, tie, extra_sharing=None):
+    """A real Accelerator and a model prepared by it, optionally with extra aliases.
+
+    extra_sharing "pair": two new Linear layers share one weight; "embedding": a
+    new Linear's weight is a further alias of the embedding.
+    """
+    accelerator = Accelerator(cpu=True)
+    torch.manual_seed(0)
+    config = e2e_config(model_type=model_type, tie_word_embeddings=tie)
+    model = build_model(config)
+    if extra_sharing == "pair":
+        model.extra_a = nn.Linear(4, 4, bias=False)
+        model.extra_b = nn.Linear(4, 4, bias=False)
+        model.extra_b.weight = model.extra_a.weight
+    elif extra_sharing == "embedding":
+        model.extra_a = nn.Linear(config.dim_embd, config.vocab_size, bias=False)
+        model.extra_a.weight = embedding_of(model).weight
+    return accelerator, accelerator.prepare(model)
+
+
+def saved_keys(ckpt_dir):
+    with safe_open(Path(ckpt_dir) / "model.safetensors", "pt") as f:
+        return set(f.keys())
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("tie", [True, False])
+def test_save_without_shared_tensor_warning(tmp_path, caplog, model_type, tie):
+    caplog.set_level(logging.WARNING)
+    accelerator, model = prepared(model_type, tie)
+    embedding = "embed.weight" if model_type == "gpt" else "token_emb.weight"
+    path = CheckpointManager(accelerator, tmp_path).save_last({"epoch": 1})
+    assert shared_tensor_warnings(caplog) == []
+    # the same file Accelerate writes itself: one copy of a tied matrix, and
+    # nothing else dropped
+    keys = saved_keys(path)
+    assert embedding in keys
+    assert keys == set(model.state_dict()) - ({"head.weight"} if tie else set())
+
+    # reload into a fresh, differently initialised model: no warning, still tied
+    caplog.clear()
+    saved = {n: p.detach().clone() for n, p in model.named_parameters()}
+    accelerator2 = Accelerator(cpu=True)
+    torch.manual_seed(1)
+    fresh = accelerator2.prepare(
+        build_model(e2e_config(model_type=model_type, tie_word_embeddings=tie))
+    )
+    load_checkpoint(accelerator2, path)
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert (fresh.head.weight is embedding_of(fresh).weight) is tie
+    for name, param in fresh.named_parameters():
+        assert torch.equal(param, saved[name]), name
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("tie", [True, False])
+@pytest.mark.parametrize(
+    "extra_sharing, reported",
+    [("pair", "'extra_b.weight'"), ("embedding", "'extra_a.weight'")],
+)
+def test_save_still_reports_other_shared_tensors(
+    tmp_path, caplog, model_type, tie, extra_sharing, reported
+):
+    caplog.set_level(logging.WARNING)
+    accelerator, _ = prepared(model_type, tie, extra_sharing)
+    CheckpointManager(accelerator, tmp_path).save_last({"epoch": 1})
+    # exactly the unexpected alias, never the tied head
+    assert shared_tensor_warnings(caplog) == [reported]
+
+
+@pytest.mark.parametrize("model_type", ["gpt", "diff"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_tied_head_hook_is_removed_after_save(tmp_path, caplog, model_type, fail):
+    caplog.set_level(logging.WARNING)
+    accelerator, _ = prepared(model_type, tie=True)
+    failing = None
+    if fail:
+
+        def raise_on_save(models, weights, output_dir):
+            raise RuntimeError("killed while saving")
+
+        failing = accelerator.register_save_state_pre_hook(raise_on_save)
+    manager = CheckpointManager(accelerator, tmp_path)
+    if fail:
+        with pytest.raises(RuntimeError, match="killed while saving"):
+            manager.save_last({"epoch": 1})
+        failing.remove()
+    else:
+        manager.save_last({"epoch": 1})
+    assert shared_tensor_warnings(caplog) == []
+    # Accelerate's own save_state, outside the manager, warns as before
+    accelerator.save_state(str(tmp_path / "direct"))
+    assert shared_tensor_warnings(caplog) == ["'head.weight'"]

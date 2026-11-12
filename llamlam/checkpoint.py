@@ -33,6 +33,15 @@ them; use `accelerator.load_state` on them directly to evaluate or sample.
 @rationale: a run killed while saving would otherwise leave `last/` with new
     weights and old (or missing) progress, which resumes silently wrong; now the
     previous `last/` survives until the new one is complete.
+@decision DEC-CKPT-004: around save_state, a save-state pre-hook drops the head's
+    alias of the tied embedding (`head.weight`) from the model state dict
+@rationale: safetensors refuses aliased tensors, so Accelerate's
+    clean_state_dict_for_safetensors deletes `head.weight` itself and logs
+    "Removed shared tensor {'head.weight'} while saving" on every save of a tied
+    model. Dropping that one key first writes the same file without the message,
+    and needs no log filter: an untied head is not touched, and any other shared
+    tensor is still removed and reported by Accelerate. Loading is unchanged
+    (safetensors' load_model restores the alias from the model's own sharing).
 """
 
 import json
@@ -43,6 +52,9 @@ from pathlib import Path
 
 import torch
 
+from llamlam.difftransformer import DiffTransformer
+from llamlam.model import GPTModel
+
 logger = logging.getLogger(__name__)
 
 LAST_DIR = "last"
@@ -50,6 +62,55 @@ PROGRESS_FILE = "progress.json"
 # accelerate 1.0.1's save_state keeps the CPU/CUDA/XPU/MLU/XLA RNG states but not
 # the MPS one, so dropout on MPS would draw different masks after a resume
 MPS_RNG_FILE = "mps_rng_state.pt"
+
+
+# (embedding, head) parameters that tie_word_embeddings makes one tensor
+TIED_WEIGHTS = {
+    GPTModel: ("embed.weight", "head.weight"),
+    DiffTransformer: ("token_emb.weight", "head.weight"),
+}
+
+
+def tied_alias_key(model, state_dict):
+    """
+    The state_dict key of `model`'s head when it is tied to its embedding, else None.
+
+    `model` is the unwrapped model; state_dict may come from a wrapper (DDP,
+    torch.compile) and so carry a key prefix. Only a head that is the embedding
+    parameter, and whose entry shares the embedding entry's storage, qualifies.
+    """
+    names = TIED_WEIGHTS.get(type(model))
+    if names is None:
+        return None
+    embedding, head = names
+    if model.get_parameter(head) is not model.get_parameter(embedding):
+        return None  # untied
+    for key, tensor in state_dict.items():
+        if key != head and not key.endswith("." + head):
+            continue
+        target = state_dict.get(key[: len(key) - len(head)] + embedding)
+        if (
+            isinstance(target, torch.Tensor)
+            and isinstance(tensor, torch.Tensor)
+            and tensor.data_ptr() == target.data_ptr()
+            and tensor.shape == target.shape
+        ):
+            return key
+    return None
+
+
+def drop_tied_head(accelerator):
+    """A save-state pre-hook that drops each tied head's alias key (DEC-CKPT-004)."""
+
+    def hook(models, weights, output_dir):
+        if len(weights) != len(models):
+            return  # FSDP / DeepSpeed / Megatron save the models themselves
+        for model, state_dict in zip(models, weights):
+            key = tied_alias_key(accelerator.unwrap_model(model), state_dict)
+            if key is not None:
+                del state_dict[key]
+
+    return hook
 
 
 def best_checkpoint_name(global_step):
@@ -123,7 +184,11 @@ class CheckpointManager:
         if self.is_main_process:
             shutil.rmtree(tmp, ignore_errors=True)  # left over from a killed save
         accelerator.wait_for_everyone()
-        accelerator.save_state(str(tmp))  # collective: every rank writes its part
+        handle = accelerator.register_save_state_pre_hook(drop_tied_head(accelerator))
+        try:
+            accelerator.save_state(str(tmp))  # collective: every rank writes its part
+        finally:
+            handle.remove()
         accelerator.wait_for_everyone()
         if self.is_main_process:
             if accelerator.device.type == "mps":  # single-process only
