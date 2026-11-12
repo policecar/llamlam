@@ -5,9 +5,12 @@ Built on plain torch.nn modules so they do not depend on the repo's models.
 
 import copy
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from llamlam.opt import GrokAdamW, Muon, zeropower_via_newtonschulz5
@@ -515,6 +518,201 @@ def test_muon_rejects_invalid_configuration():
         Muon(lin.parameters(), ns_steps=0)
     with pytest.raises(ValueError, match="both"):
         Muon([lin.weight], adamw_params=[lin.weight])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(adamw_lr=-1e-2),  # gradient ascent on the AdamW path
+        dict(adamw_wd=-0.1),
+        dict(adamw_eps=-1e-8),
+        dict(adamw_betas=(-0.1, 0.95)),
+        dict(adamw_betas=(1.0, 0.95)),
+        dict(adamw_betas=(0.95, -0.1)),
+        dict(adamw_betas=(0.95, 1.0)),
+    ],
+)
+def test_muon_rejects_invalid_adamw_hyperparameters(kwargs):
+    with pytest.raises(ValueError):
+        Muon(nn.Linear(2, 2).parameters(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    "group",
+    [
+        dict(lr=-0.02),
+        dict(adamw_lr_ratio=-1.0),
+        dict(adamw_wd=-0.1),
+        dict(adamw_eps=-1e-8),
+        dict(adamw_betas=(0.95, 1.0)),
+    ],
+)
+def test_muon_add_param_group_rejects_invalid_values(group):
+    """build_optimizer adds a second group with its own adamw_wd; a group's own
+    values are checked like the constructor's, before the group is added."""
+    opt = Muon(nn.Linear(2, 2).parameters())
+    extra = nn.Parameter(torch.zeros(3))
+    with pytest.raises(ValueError):
+        opt.add_param_group({"params": [extra], **group})
+    assert len(opt.param_groups) == 1
+
+
+def test_muon_accepts_zero_adamw_hyperparameters():
+    """0 is valid wherever torch's AdamW allows it (lr, eps, betas, weight decay)."""
+    lin = nn.Linear(2, 2)
+    opt = Muon(
+        [lin.weight],
+        adamw_lr=0.0,
+        adamw_wd=0.0,
+        adamw_eps=0.0,
+        adamw_betas=(0.0, 0.0),
+    )
+    opt.add_param_group(
+        {"params": [lin.bias], "lr": 0.0, "adamw_lr_ratio": 0.0, "adamw_wd": 0.0}
+    )
+    assert len(opt.param_groups) == 2
+
+
+# Distributed Muon, simulated in one process: each rank is an optimizer constructed
+# with WORLD_SIZE/RANK in the environment, stepped in its own thread, and
+# dist.all_reduce is replaced by a barrier-synchronised SUM over the ranks' tensors.
+# Every rank holds an identical model copy and computes the same gradients, as after
+# DDP's gradient all-reduce. step() itself (ownership, buffers, all-reduce, apply) is
+# the real code.
+
+
+class _FakeAllReduce:
+    def __init__(self, world_size):
+        self.barrier = threading.Barrier(world_size, timeout=60)
+        self.tensors = [None] * world_size
+        self.local = threading.local()
+
+    def __call__(self, tensor, op=None):
+        assert op == dist.ReduceOp.SUM
+        self.tensors[self.local.rank] = tensor
+        self.barrier.wait()
+        total = torch.stack(self.tensors).sum(dim=0)  # same order on every rank
+        self.barrier.wait()  # nobody overwrites its input before all have summed
+        tensor.copy_(total)
+
+
+def _muon_net(seed=0):
+    """Six Muon matrices (one of them unused), biases on the AdamW path."""
+    torch.manual_seed(seed)
+    return nn.ModuleDict(
+        dict(
+            body=nn.Sequential(
+                nn.Linear(8, 16), nn.Tanh(), nn.Linear(16, 16), nn.Tanh()
+            ),
+            mid=nn.Linear(16, 16, bias=False),
+            unused=nn.Linear(16, 16, bias=False),
+            out=nn.Linear(16, 16, bias=False),
+            head=nn.Linear(16, 1),
+        )
+    )
+
+
+def _muon_net_loss(net, x, y):
+    h = net["out"](torch.tanh(net["mid"](net["body"](x))))
+    return nn.functional.mse_loss(net["head"](h), y)
+
+
+def _make_ranks(monkeypatch, nets, state_dict=None):
+    opts = []
+    for rank, net in enumerate(nets):
+        monkeypatch.setenv("WORLD_SIZE", str(len(nets)))
+        monkeypatch.setenv("RANK", str(rank))
+        opt = Muon(net.parameters(), lr=0.02, adamw_lr=1e-2)
+        if state_dict is not None:
+            opt.load_state_dict(copy.deepcopy(state_dict))
+        opts.append(opt)
+    assert [o.rank for o in opts] == list(range(len(nets)))
+    return opts
+
+
+def _distributed_steps(monkeypatch, nets, opts, steps, x, y):
+    fake = _FakeAllReduce(len(nets))
+    monkeypatch.setattr(dist, "all_reduce", fake)
+
+    def step(rank):
+        fake.local.rank = rank
+        opts[rank].step()
+
+    for _ in range(steps):
+        for net, opt in zip(nets, opts):
+            opt.zero_grad()
+            _muon_net_loss(net, x, y).backward()
+        with ThreadPoolExecutor(len(nets)) as pool:
+            for f in [pool.submit(step, r) for r in range(len(nets))]:
+                f.result()  # re-raise a rank's exception
+
+
+def _muon_matrices(net):
+    return [net["body"][0].weight, net["body"][2].weight] + [
+        net[k].weight for k in ("mid", "unused", "out", "head")
+    ]
+
+
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_distributed_muon_every_rank_keeps_every_momentum_buffer(
+    monkeypatch, world_size
+):
+    """Each rank updates the momentum of every Muon parameter (not only the ones it
+    orthogonalises), so whichever rank's optimizer state is saved is complete.
+    A parameter without a gradient gets no buffer and does not move, on any rank."""
+    x, y = _data(n=64)
+    nets = [_muon_net() for _ in range(world_size)]
+    before_unused = nets[0]["unused"].weight.detach().clone()
+    opts = _make_ranks(monkeypatch, nets)
+    _distributed_steps(monkeypatch, nets, opts, 3, x, y)
+
+    ref = nets[0]
+    for net, opt in zip(nets, opts):
+        for p in _muon_matrices(net):
+            assert opt.state[p]["use_muon"] is True
+        for p, p_ref in zip(_muon_matrices(net), _muon_matrices(ref)):
+            if p is net["unused"].weight:
+                assert set(opt.state[p]) == {"use_muon"}
+                assert torch.equal(p, before_unused)
+                continue
+            buf = opt.state[p]["momentum_buffer"]
+            torch.testing.assert_close(
+                buf, opts[0].state[p_ref]["momentum_buffer"], rtol=0, atol=0
+            )
+        for a, b in zip(net.parameters(), ref.parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("world_size,source_rank", [(2, 0), (2, 1), (3, 2)])
+def test_distributed_muon_resume_from_any_ranks_state(
+    monkeypatch, world_size, source_rank
+):
+    """Accelerate saves one process's optimizer state and every rank loads it.
+    Resuming from it must continue exactly like the uninterrupted run, on every
+    rank, including the parameters that other ranks orthogonalise."""
+    x, y = _data(n=64)
+    steps_before, steps_after = 3, 3
+
+    nets = [_muon_net() for _ in range(world_size)]
+    opts = _make_ranks(monkeypatch, nets)
+    _distributed_steps(monkeypatch, nets, opts, steps_before, x, y)
+    saved_net = copy.deepcopy(nets[source_rank].state_dict())
+    saved_opt = copy.deepcopy(opts[source_rank].state_dict())
+    _distributed_steps(monkeypatch, nets, opts, steps_after, x, y)
+
+    resumed = [_muon_net(seed=123) for _ in range(world_size)]
+    for net in resumed:
+        net.load_state_dict(saved_net)
+    resumed_opts = _make_ranks(monkeypatch, resumed, state_dict=saved_opt)
+    _distributed_steps(monkeypatch, resumed, resumed_opts, steps_after, x, y)
+
+    for net in resumed:
+        for a, b in zip(net.parameters(), nets[0].parameters()):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+    # Non-vacuous: the continuation moved the parameters.
+    assert any(
+        not torch.equal(p, saved_net[k]) for k, p in nets[0].state_dict().items()
+    )
 
 
 # --------------------------------------------------------------------------- #

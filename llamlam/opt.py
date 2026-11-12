@@ -20,6 +20,14 @@ Up-and-coming optimizers:
     normalised by its group size, so gamma spans the whole group (differs from upstream).
 @rationale: Upstream's raw position drives beta1 to ~0 for most tensors of a real
     model; see "Differences from upstream" in the GrokAdamW docstring.
+@decision DEC-OPT-005: In distributed Muon every rank updates every Muon parameter's
+    momentum buffer; only the orthogonalisation is split across ranks (differs from
+    upstream, which keeps each buffer on its owning rank only).
+@rationale: Accelerate saves the optimizer state of one process and every rank loads
+    it, so per-rank buffers restarted from zero on resume for the parameters other
+    ranks own. Gradients are identical on all ranks after DDP's all-reduce (train.py
+    syncs on every backward and clips the synced gradients), so the buffers are too.
+    Cost: one full copy of Muon's momentum per rank.
 """
 
 import math
@@ -306,6 +314,15 @@ class Muon(torch.optim.Optimizer):
 
     Distributed: if WORLD_SIZE is set, each rank orthogonalizes every WORLD_SIZE-th Muon
     parameter and the updates are summed with dist.all_reduce (process group must exist).
+    Every rank updates the momentum buffer of every Muon parameter, so each rank holds
+    a full copy of Muon's momentum (as large as the Muon parameters, in the gradients'
+    dtype, as in single-process training) rather than about 1/WORLD_SIZE of it; in
+    exchange any rank's state_dict resumes all ranks (DEC-OPT-005). Requires identical
+    gradients on all ranks at step(), as after DDP's gradient all-reduce.
+
+    Raises ValueError for invalid hyperparameters, in add_param_group too: lr must be
+    > 0 in the constructor (>= 0 in an added group); the AdamW lr, eps and weight
+    decay >= 0; the AdamW betas in [0, 1).
     """
 
     def __init__(
@@ -365,6 +382,26 @@ class Muon(torch.optim.Optimizer):
             self.world_size = 1
             self.rank = 0
 
+    def add_param_group(self, param_group):
+        """torch's add_param_group, after checking the group's own values or the
+        defaults it will take. Also runs for the constructor's group."""
+        value = {k: param_group.get(k, v) for k, v in self.defaults.items()}
+        beta1, beta2 = value["adamw_betas"]
+        if not 0.0 <= value["lr"]:
+            raise ValueError(f"Invalid learning rate: {value['lr']}")
+        if not 0.0 <= value["adamw_lr_ratio"]:
+            raise ValueError(
+                f"Invalid adamw_lr: {value['adamw_lr_ratio'] * value['lr']} "
+                f"(adamw_lr_ratio={value['adamw_lr_ratio']})"
+            )
+        if not 0.0 <= value["adamw_eps"]:
+            raise ValueError(f"Invalid adamw_eps value: {value['adamw_eps']}")
+        if not (0.0 <= beta1 < 1.0 and 0.0 <= beta2 < 1.0):
+            raise ValueError(f"Invalid adamw_betas: {value['adamw_betas']}")
+        if not 0.0 <= value["adamw_wd"]:
+            raise ValueError(f"Invalid adamw_wd value: {value['adamw_wd']}")
+        super().add_param_group(param_group)
+
     @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step.
@@ -395,16 +432,21 @@ class Muon(torch.optim.Optimizer):
                 )
                 curr_idx = 0
                 for i, p in enumerate(params):
+                    if p.grad is None:
+                        curr_idx += p.numel()
+                        continue
+                    g = p.grad
+                    if g.ndim > 2:
+                        g = g.view(g.size(0), -1)
+                    # Every rank keeps every buffer (DEC-OPT-005): p.grad is the same
+                    # on all ranks, so the buffers are too, and any rank's state resumes.
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
                     # luckily this will perfectly distribute a transformer with multiple of 4 layers to 8 GPUs
-                    if i % self.world_size == self.rank and p.grad is not None:
-                        g = p.grad
-                        if g.ndim > 2:
-                            g = g.view(g.size(0), -1)
-                        state = self.state[p]
-                        if "momentum_buffer" not in state:
-                            state["momentum_buffer"] = torch.zeros_like(g)
-                        buf = state["momentum_buffer"]
-                        buf.mul_(momentum).add_(g)
+                    if i % self.world_size == self.rank:
                         if group["nesterov"]:
                             g = g.add(buf, alpha=momentum)
                         else:
