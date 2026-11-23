@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 
 import pytest
+import torch
 import yaml
 from accelerate.state import AcceleratorState
 
@@ -214,6 +215,31 @@ def fresh_accelerator_state():
 def test_build_accelerator_passes_mixed_precision(mode, fresh_accelerator_state):
     accelerator = build_accelerator(Config(mixed_precision=mode), cpu=True)
     assert accelerator.mixed_precision == mode
+
+
+@pytest.mark.parametrize("use_cpu", ["cpu=True", "ACCELERATE_USE_CPU"])
+def test_build_accelerator_refuses_fp16_on_cpu(
+    use_cpu, fresh_accelerator_state, monkeypatch
+):
+    # Accelerate enables neither autocast nor a gradient scaler for fp16 on CPU,
+    # so the run would silently train in float32
+    kwargs = {"cpu": True} if use_cpu == "cpu=True" else {}
+    if use_cpu == "ACCELERATE_USE_CPU":
+        monkeypatch.setenv("ACCELERATE_USE_CPU", "1")
+    with pytest.raises(ValueError, match=r"fp16 .*CPU.*use bf16 or no"):
+        build_accelerator(Config(mixed_precision="fp16"), **kwargs)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs Apple MPS")
+@pytest.mark.parametrize("mode", ["fp16", "bf16"])
+def test_build_accelerator_mixed_precision_on_mps(
+    mode, fresh_accelerator_state, monkeypatch
+):
+    monkeypatch.delenv("ACCELERATE_USE_CPU", raising=False)
+    accelerator = build_accelerator(Config(mixed_precision=mode))
+    assert accelerator.device.type == "mps"
+    assert accelerator.mixed_precision == mode
+    assert (accelerator.scaler is not None) == (mode == "fp16")
 
 
 @pytest.mark.parametrize("mode", ["fp8", "bfloat16", "", None, True])

@@ -639,9 +639,9 @@ def test_prepared_scheduler_ends_on_last_optimizer_step(tmp_path, accelerator):
         accelerator,
         config,
         tmp_path,
-        log=lambda m, step=None: lrs.append(m["learning_rate"])
-        if "learning_rate" in m
-        else None,
+        log=lambda m, step=None: (
+            lrs.append(m["learning_rate"]) if "learning_rate" in m else None
+        ),
     )
     assert result["n_optimizer_steps"] == counts[1]
     assert scheduler.scheduler.last_epoch == counts[1]

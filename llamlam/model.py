@@ -112,9 +112,9 @@ class Context(nn.Module):
         self.dim_embd = dim_embd
         self.n_heads = n_heads
         self.dim_head = dim_embd // n_heads  # because efficiency
-        assert (
-            self.dim_head * n_heads == dim_embd
-        ), "dim_head should be dim_embd // n_heads because efficiency"
+        assert self.dim_head * n_heads == dim_embd, (
+            "dim_head should be dim_embd // n_heads because efficiency"
+        )
 
         # Scale factor for dot product attention, used by every attention call
         # below; see Attention is All You Need paper (Vaswani et al., 2017), page 4:
