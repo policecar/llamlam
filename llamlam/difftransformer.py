@@ -253,7 +253,7 @@ class DiffTransformerLayer(nn.Module):
     Consists of Multi-Head Differential Attention followed by a SwiGLU Feed-Forward Network.
     """
 
-    def __init__(self, dim_embd, n_heads, lambda_init, dropout=0.0):
+    def __init__(self, dim_embd, n_heads, lambda_init, dropout=0.0, bias=True):
         """
         Args:
             dim_embd (int): Dimension of the model.
@@ -261,12 +261,13 @@ class DiffTransformerLayer(nn.Module):
                 MultiHeadDifferentialAttention), not the baseline head count.
             lambda_init (float): Initial value for lambda in Differential Attention.
             dropout (float): Residual dropout rate (as in GPT's Block).
+            bias (bool): Biases in the feed-forward layers (config.bias).
         """
         super().__init__()
         self.norm1 = RMSNorm(dim_embd)
         self.attn = MultiHeadDifferentialAttention(dim_embd, n_heads, lambda_init)
         self.norm2 = RMSNorm(dim_embd)
-        self.ff = SwiGLU(dim_embd)
+        self.ff = SwiGLU(dim_embd, bias=bias)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x, past_kv=None, use_cache=False):
@@ -331,6 +332,7 @@ class DiffTransformer(nn.Module):
                     lambda_init=0.8
                     - 0.6 * math.exp(-0.3 * (l - 1)),  # Decaying lambda_init
                     dropout=self.config.dropout,
+                    bias=self.config.bias,
                 )
                 for l in range(1, self.config.n_layers + 1)  # noqa: E741
             ]

@@ -112,9 +112,9 @@ class Context(nn.Module):
         self.dim_embd = dim_embd
         self.n_heads = n_heads
         self.dim_head = dim_embd // n_heads  # because efficiency
-        assert (
-            self.dim_head * n_heads == dim_embd
-        ), "dim_head should be dim_embd // n_heads because efficiency"
+        assert self.dim_head * n_heads == dim_embd, (
+            "dim_head should be dim_embd // n_heads because efficiency"
+        )
 
         # Scale factor for dot product attention, used by every attention call
         # below; see Attention is All You Need paper (Vaswani et al., 2017), page 4:
@@ -128,11 +128,10 @@ class Context(nn.Module):
         self.qkv_proj = nn.Linear(dim_embd, 3 * dim_embd, bias=False)
         self.out_proj = nn.Linear(dim_embd, dim_embd, bias=False)
 
-    def forward(self, x, mask=None, past_kv=None, use_cache=False):
+    def forward(self, x, past_kv=None, use_cache=False):
         """
         Args:
             x: [B, L, dim_embd], the new positions only when past_kv is given
-            mask: passed to SDPA alongside is_causal=True (no-cache path only)
             past_kv: optional cached (K, V), each [B, n_heads, L_past, dim_head]
             use_cache: if True, also return the updated (K, V)
 
@@ -158,11 +157,9 @@ class Context(nn.Module):
 
         if past_kv is None:
             attn_output = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, is_causal=True, scale=self.scaling
+                q, k, v, is_causal=True, scale=self.scaling
             )
         else:
-            if mask is not None:
-                raise ValueError("mask is not supported together with past_kv")
             past_k, past_v = past_kv
             k = torch.cat((past_k, k), dim=2)  # [B n_heads L_past+L d]
             v = torch.cat((past_v, v), dim=2)

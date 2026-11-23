@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from llamlam.config import Config
@@ -120,6 +121,30 @@ def test_reference_projection_layout():
     assert ff.WG.weight.shape == (8 * d // 3, d)
     assert ff.W1.weight.shape == (8 * d // 3, d)
     assert ff.W2.weight.shape == (d, 8 * d // 3)
+
+
+@pytest.mark.parametrize("model_cls", [GPTModel, DiffTransformer])
+def test_bias_false_gives_no_bias_parameters(model_cls):
+    model = model_cls(small_config(bias=False))
+    assert [n for n, _ in model.named_parameters() if "bias" in n] == []
+
+
+@pytest.mark.parametrize("bias", [False, True])
+def test_feedforward_bias_follows_config_in_both_models(bias):
+    config = small_config(bias=bias)
+    gpt_ff = [
+        m
+        for block in GPTModel(config).blocks
+        for m in block.feedforward
+        if isinstance(m, nn.Linear)
+    ]
+    diff_ff = [
+        m for layer in DiffTransformer(config).layers for m in layer.ff.children()
+    ]
+    assert len(gpt_ff) == 2 * config.n_layers and len(diff_ff) == 3 * config.n_layers
+    for linear in gpt_ff + diff_ff:
+        assert isinstance(linear, nn.Linear)
+        assert (linear.bias is not None) == bias
 
 
 @pytest.mark.parametrize("n_heads", [0, 1, 3, 13])

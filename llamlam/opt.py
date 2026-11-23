@@ -125,25 +125,11 @@ class GrokAdamW(Optimizer):
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
-        return self._step_impl(closure, use_amp=False)
-
-    @torch.no_grad()
-    def step_amp(
-        self, closure: Optional[Callable[[], float]] = None
-    ) -> Optional[float]:
-        return self._step_impl(closure, use_amp=True)
-
-    def _step_impl(
-        self, closure: Optional[Callable[[], float]], use_amp: bool
-    ) -> Optional[float]:
         """Performs a single optimization step.
 
         Args:
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
-            use_amp (bool): Run the update under torch.autocast for the parameters'
-                device type. The update is in-place elementwise math, which autocast
-                does not recast, so this matches step().
 
         Returns:
             Optional[float]: The loss value returned by the closure, if provided.
@@ -161,13 +147,7 @@ class GrokAdamW(Optimizer):
             indexed = [
                 (i, p) for i, p in enumerate(group["params"]) if p.grad is not None
             ]
-            if not indexed:
-                continue
-
-            if use_amp:
-                with torch.autocast(device_type=indexed[0][1].device.type):
-                    self._update_group(group, indexed, grokking_signal)
-            else:
+            if indexed:
                 self._update_group(group, indexed, grokking_signal)
 
         return loss
@@ -206,7 +186,7 @@ class GrokAdamW(Optimizer):
                     "[0, 1]; signals must be non-negative."
                 )
 
-        # Positions run over the whole group, with or without grads (see _step_impl).
+        # Positions run over the whole group, with or without grads (see step).
         last_index = len(group["params"]) - 1
 
         for i, p in indexed_params:

@@ -114,12 +114,12 @@ def test_tying_removes_exactly_one_vocab_by_dim_matrix(model_cls):
 
 
 def test_parameter_counts_at_default_config():
-    """The totals quoted in the README / review report, tied and untied."""
+    """Exact parameter totals at the default config, tied and untied."""
     expected = {
         (GPTModel, True): 124_337_664,
         (GPTModel, False): 162_935_040,
-        (DiffTransformer, True): 124_400_640,
-        (DiffTransformer, False): 162_998_016,
+        (DiffTransformer, True): 124_342_272,
+        (DiffTransformer, False): 162_939_648,
     }
     for (model_cls, tie), count in expected.items():
         with torch.device("meta"):

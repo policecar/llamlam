@@ -98,9 +98,9 @@ def test_gradient_clipping(det_model, train_config):
         det_model.parameters(), float("inf")
     )
 
-    assert (
-        clipped_grad_norm <= max_norm + 1e-5
-    ), "Gradient clipping did not limit gradient norm"
+    assert clipped_grad_norm <= max_norm + 1e-5, (
+        "Gradient clipping did not limit gradient norm"
+    )
     assert clipped_grad_norm == pytest.approx(max_norm, rel=1e-4)
 
     # Clipping rescales, it does not change the gradient direction
@@ -124,9 +124,9 @@ def test_dropout(model):
     output1 = model(input_ids)["logits"]
     output2 = model(input_ids)["logits"]
 
-    assert not torch.allclose(
-        output1, output2
-    ), "Model outputs are identical in train mode"
+    assert not torch.allclose(output1, output2), (
+        "Model outputs are identical in train mode"
+    )
 
 
 def test_layer_norm(model):
@@ -141,9 +141,9 @@ def test_layer_norm(model):
         x = 3 * torch.randn(4, 16, dim) + 5
         output = module(x)
 
-        assert torch.allclose(
-            output.mean(dim=-1), torch.zeros(4, 16), atol=1e-5
-        ), "LayerNorm output mean is not close to zero"
+        assert torch.allclose(output.mean(dim=-1), torch.zeros(4, 16), atol=1e-5), (
+            "LayerNorm output mean is not close to zero"
+        )
         # LayerNorm uses the biased variance; eps=1e-5 lowers the std by ~1e-6
         assert torch.allclose(
             output.std(dim=-1, unbiased=False), torch.ones(4, 16), atol=1e-4
@@ -192,13 +192,13 @@ def test_weight_initialization(init_std, tie):
         else:
             assert name.endswith(".weight"), f"Unexpected parameter {name}"
             std = residual_std if name.endswith(RESIDUAL_PROJECTIONS) else init_std
-            assert param.std().item() == pytest.approx(
-                std, rel=0.06
-            ), f"Weight {name} has std {param.std().item():.5f}, expected {std:.5f}"
+            assert param.std().item() == pytest.approx(std, rel=0.06), (
+                f"Weight {name} has std {param.std().item():.5f}, expected {std:.5f}"
+            )
             # mean within 5 standard errors of zero
-            assert (
-                param.mean().abs() < 5 * std / param.numel() ** 0.5
-            ), f"Weight {name} has high mean"
+            assert param.mean().abs() < 5 * std / param.numel() ** 0.5, (
+                f"Weight {name} has high mean"
+            )
 
     # every class of parameter was checked; the head is the embedding iff tied
     assert {"embed.weight", "pos_embed", "ln_f.weight", "ln_f.bias"} <= seen
