@@ -539,7 +539,7 @@ def run_training(
         avg_train_loss = train_loss / n_micro_batches
         val_loss, perplexity = evaluate(model, val_loader, accelerator=accelerator)
         logger.info(
-            f"Epoch {epoch+1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
+            f"Epoch {epoch + 1}, train loss, validation loss: {avg_train_loss}, {val_loss}"
         )
         # log validation loss and metric after each epoch
         log(

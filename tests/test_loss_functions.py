@@ -55,9 +55,9 @@ def test_loss_reduction(model):
         shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
     )
 
-    assert torch.allclose(
-        loss, manual_loss
-    ), "Model loss doesn't match manually calculated loss"
+    assert torch.allclose(loss, manual_loss), (
+        "Model loss doesn't match manually calculated loss"
+    )
 
 
 def test_loss_backpropagation(model):
@@ -68,9 +68,9 @@ def test_loss_backpropagation(model):
 
     for param in model.parameters():
         assert param.grad is not None, "Some parameters don't have gradients"
-        assert not torch.allclose(
-            param.grad, torch.zeros_like(param.grad)
-        ), "Some gradients are zero"
+        assert not torch.allclose(param.grad, torch.zeros_like(param.grad)), (
+            "Some gradients are zero"
+        )
 
 
 def test_loss_with_padding(model):
@@ -95,12 +95,12 @@ def test_loss_with_padding(model):
     )
     manual_loss = (manual_loss * mask.view(-1)).sum() / mask.sum()
 
-    assert torch.allclose(
-        loss_with_padding, manual_loss
-    ), "Loss doesn't handle padding correctly"
-    assert not torch.allclose(
-        loss_with_padding, model(input_ids)["loss"]
-    ), "Padding mask had no effect on the loss"
+    assert torch.allclose(loss_with_padding, manual_loss), (
+        "Loss doesn't handle padding correctly"
+    )
+    assert not torch.allclose(loss_with_padding, model(input_ids)["loss"]), (
+        "Padding mask had no effect on the loss"
+    )
 
 
 def test_loss_with_uniform_distribution(model):
@@ -115,9 +115,9 @@ def test_loss_with_uniform_distribution(model):
     assert torch.equal(output["logits"], torch.zeros_like(output["logits"]))
 
     expected_loss = torch.tensor(math.log(model.config.vocab_size))
-    assert torch.allclose(
-        output["loss"], expected_loss
-    ), "Loss for uniform distribution is incorrect"
+    assert torch.allclose(output["loss"], expected_loss), (
+        "Loss for uniform distribution is incorrect"
+    )
 
 
 def test_loss_with_perfect_prediction(model):
@@ -137,9 +137,9 @@ def test_loss_with_perfect_prediction(model):
     finally:
         handle.remove()
 
-    assert torch.allclose(
-        loss, torch.tensor(0.0)
-    ), f"Loss for perfect prediction is not zero: {loss.item()}"
+    assert torch.allclose(loss, torch.tensor(0.0)), (
+        f"Loss for perfect prediction is not zero: {loss.item()}"
+    )
 
 
 def test_loss_gradient_norm(model):
@@ -154,6 +154,6 @@ def test_loss_gradient_norm(model):
             total_norm += param.grad.data.norm(2).item() ** 2
     total_norm = total_norm**0.5
 
-    assert (
-        1e-5 < total_norm < 1e5
-    ), f"Gradient norm {total_norm} is outside reasonable range"
+    assert 1e-5 < total_norm < 1e5, (
+        f"Gradient norm {total_norm} is outside reasonable range"
+    )

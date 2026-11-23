@@ -91,9 +91,9 @@ def test_gradient_magnitude(model):
 
     for name, param in model.named_parameters():
         grad_norm = param.grad.norm()
-        assert (
-            1e-6 < grad_norm < 1e3
-        ), f"Unusual gradient magnitude for {name}: {grad_norm}"
+        assert 1e-6 < grad_norm < 1e3, (
+            f"Unusual gradient magnitude for {name}: {grad_norm}"
+        )
 
 
 def test_learning_rate_sensitivity(model):
@@ -152,9 +152,9 @@ def test_gradient_clipping(model):
 
     # The clipped gradient norm is exactly max_norm ...
     new_norm = nn.utils.clip_grad_norm_(model.parameters(), float("inf"))
-    assert torch.isclose(
-        new_norm, torch.tensor(max_norm), rtol=1e-4
-    ), f"Gradient norm {new_norm} is not max_norm {max_norm}"
+    assert torch.isclose(new_norm, torch.tensor(max_norm), rtol=1e-4), (
+        f"Gradient norm {new_norm} is not max_norm {max_norm}"
+    )
 
     # ... reached by rescaling every gradient by the same factor
     for g0, p in zip(original_grads, model.parameters()):
